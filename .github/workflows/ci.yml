@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      # The M6-c producer/verifier surface (signed_leaf + decision_chain) lives behind `leaf-verify`.
+      - name: clippy (default)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (leaf-verify)
+        run: cargo clippy --all-targets --features leaf-verify -- -D warnings
+
+      - name: test (default)
+        run: cargo test
+      - name: test (leaf-verify)
+        run: cargo test --features leaf-verify

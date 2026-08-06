@@ -1,0 +1,4 @@
+# The repo-root .gitignore ignores *.der for key hygiene. Everything here is a SYNTHETIC PUBLIC test
+# certificate (OpenSSL-generated CA/leaf with throwaway keys — NOT secrets), required by the P4
+# chain-validation negative tests. Re-include all of them. See README.md for the PKI topology.
+!*.der

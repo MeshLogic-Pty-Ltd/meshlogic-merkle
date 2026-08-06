@@ -1,0 +1,3 @@
+# Binary RFC 3161 / DER test vectors — never apply text/CRLF normalization (would corrupt the DER).
+*.tsr binary
+*.der binary

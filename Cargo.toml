@@ -1,0 +1,164 @@
+[package]
+name = "meshlogic-merkle"
+version = "0.1.0"
+edition = "2021"
+description = "MAC-1 Merkle commitment core (RFC 6962 over ADR-042 content_hash leaves). Shared by the ADR-043 tamper-evidence PRODUCER and the zero-trust offline VERIFIER so the two can never drift (mac-lead P1a Q1)."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+# `oid` feature: makes Sha256/Sha384/Sha512 impl `AssociatedOid`, required by
+# `rsa::Pkcs1v15Sign::new::<D>()` (the offline verifier's RSA chain-signature path).
+sha2 = { version = "0.10", features = ["oid"] }
+x509-tsp = "0.1"
+der = "0.7"
+spki = "0.7"
+const-oid = { version = "0.9", features = ["db"] }
+cms = "0.2"
+hex = "0.4"
+# FULL RFC 3161 TST cryptographic verification (feature `offline-verify`): X.509 cert parsing +
+# EKU/validity/basic-constraints checks, RSA-PKCS1 and ECDSA (P-256/P-384) signature verification for
+# BOTH the CMS SignerInfo signature AND the signer→trusted-root certificate-chain signature. OPTIONAL
+# so the shared Merkle+producer core stays dependency-light — only the auditor's offline verifier
+# pulls these in. Pure-Rust RustCrypto (no OpenSSL FFI), version-aligned with the `cms`/`der`/`spki`
+# 0.7 / const-oid 0.9 stack already in the tree.
+x509-cert = { version = "0.2", optional = true, features = ["pem"] }
+rsa = { version = "0.9", optional = true }
+p256 = { version = "0.13", optional = true, features = ["ecdsa", "pem"] }
+p384 = { version = "0.13", optional = true, features = ["ecdsa"] }
+# JSON + base64 for the ADR-043 slice-1a commitment-leaf module: reading captured CommitmentLeaf
+# blobs, base64-decoding the canonical preimage, and emitting the auditor artifact. Pure-Rust,
+# both already in the wider workspace (serde_json was already a dev-dep here). The offline
+# verifier core stays OpenSSL-free; these are the only additions.
+serde_json = "1"
+base64 = "0.22"
+# HTTP client + RNG for the live TSA POST - OPTIONAL (feature `tsa-client`) so the offline
+# verifier / producer core never pulls them. Pure-Rust (rustls TLS), no OpenSSL FFI.
+ureq = { version = "2", optional = true }
+getrandom = { version = "0.2", optional = true }
+
+# AWS SDK + async runtime for the ADR-043 C1 P1b PR-2 proof-generation CLI (`commitment_proof_gen`):
+# reads the org roots-chain from DynamoDB and RE-LISTS the period's commitment leaves from S3 to
+# re-derive an inclusion proof. OPTIONAL (feature `aws-reads`) — same gate style as `tsa-client`, so
+# the shared Merkle/verify core + the offline verifier never link the AWS SDK. The rustls-safe SDK
+# feature set (default-https-client = rustls-aws-lc + rt-tokio; NOT the legacy `rustls` default that
+# pulls the RUSTSEC-2026-0098/9/104 rustls 0.21 path) mirrors backend/lambda-rust's workspace pins.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"], optional = true }
+aws-config = { version = "1.8", optional = true }
+aws-sdk-dynamodb = { version = "1.113", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-s3 = { version = "1.137", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+chrono = { version = "0.4", optional = true }
+
+# ADR-043 C1 M6-a — the signed commitment-leaf collection boundary (feature `leaf-verify`). Verifies
+# each leaf's per-agent enrolled Ed25519 identity signature (ADR-062 fleet identity) over the full
+# canonical leaf envelope, fail-closed against a pinned trust store. OPTIONAL (same gate style as
+# offline-verify / rekor-verify) so the shared Merkle/producer core stays dependency-light — only the
+# signed-boundary verifier pulls Ed25519. Pure-Rust RustCrypto (curve25519-dalek), no OpenSSL FFI;
+# `verify_strict` rejects malleable signatures + small-order keys.
+ed25519-dalek = { version = "2", optional = true }
+# R7 Task 4 — the `meshlogic_verify` bin's zip-input reading (feature `offline-verify`, folded in
+# below). Reading only (no writing), so `default-features = false` with just `deflate` (the
+# standard zip compression method) keeps this dependency-light — no bzip2/zstd/AES codecs the
+# verifier never needs.
+zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
+
+[features]
+# The live RFC 3161 TSA round-trip (network + random nonce). Off by default: the shared
+# Merkle+verify core stays dependency-light; only the producer enables it.
+tsa-client = ["dep:ureq", "dep:getrandom"]
+# AWS reads for the proof-generation CLI (DynamoDB roots-chain + S3 commitment-leaf re-listing).
+aws-reads = ["dep:tokio", "dep:aws-config", "dep:aws-sdk-dynamodb", "dep:aws-sdk-s3", "dep:serde", "dep:chrono"]
+# The offline auditor's FULL RFC 3161 TST cryptographic verifier: `anchor::verify_tst_full` +
+# the standalone `commitment_proof_verify` binary. Off by default (heavier RustCrypto x509/rsa/ecdsa
+# deps). NO AWS, NO network — verifies a ProofBundle + its TST(s) against caller-supplied trusted roots.
+# `dep:serde` (already a normal, non-new dependency — see the `aws-reads` feature above) is wired in
+# here too so the R7 `self_contained` bundle types (feature-gated on `offline-verify`) can derive
+# Serialize/Deserialize; the crate declares no new dependency for this.
+offline-verify = ["dep:x509-cert", "dep:rsa", "dep:p256", "dep:p384", "dep:serde", "dep:zip", "rekor-verify"]
+# ADR-043 C1 P3 — the production OFFLINE co-anchor VERIFIER (`coanchor`): reproduce the Rekor
+# inclusion proof to the checkpoint root (reusing the crate's RFC 6962 `verify_inclusion`) + verify
+# the checkpoint's ECDSA-P256 signature against a pinned Rekor log public key, then GRADE the root
+# (CoAnchored / AnchoredOnly). `serde_json`/`base64`/`sha2`/`hex` are already always-on; only P-256
+# is gated here. NETWORK-FREE (no HTTP client, no publish path — that is the producer PR's concern).
+# Implied by `offline-verify` so the auditor's full offline verifier pulls it in.
+rekor-verify = ["dep:p256"]
+# ADR-043 C1 P3 phase-2b — the PRODUCER co-anchor PUBLISH path (`publish_root_to_rekor` +
+# `EphemeralSigner`): signs a root via an injected `CoAnchorSigner` and submits a Rekor
+# `hashedrekord` entry over pure-Rust HTTP (`ureq` + rustls), reading the entry back for its
+# inclusion proof + signed checkpoint. Pulls the network client (`ureq`) + `getrandom` (ephemeral
+# test signer) ON TOP of the `rekor-verify` crypto. OFF by default — only the tamper-evidence
+# builder (and the `#[ignore]` live round-trip test) enable it; the shared verifier core never links
+# an HTTP client.
+rekor-client = ["rekor-verify", "dep:ureq", "dep:getrandom"]
+# ADR-043 C1 M6-a — the SIGNED commitment-leaf verifier: per-agent enrolled Ed25519 identity signature
+# over the full canonical leaf envelope + a rotation-capable pinned fleet-identity trust store, graded
+# fail-closed. Off by default (pulls `ed25519-dalek`); the shared Merkle/producer core never links it.
+leaf-verify = ["dep:ed25519-dalek", "dep:serde"]
+# R7 Task 4 review (AI-review HIGH-2) — explicit opt-in for the `meshlogic_verify` bin's POV (proof-
+# of-value) demo trust anchor (the pinned freeTSA fixture root + the deterministic ECDSA-P256
+# fixture key, via `self_contained::pov_bundle_trust_store`/`pov_bundle_signing_key` — R7 signing-key
+# task 3 replaced the old string-fingerprint fixture these gated). No new dependency: this feature
+# exists solely so a naked `cargo build --release` of the bin (no `debug_assertions`, no explicit opt-in)
+# hits `meshlogic_verify.rs`'s `compile_error!` instead of silently shipping the fixture as if it
+# were a real trust anchor. Dev/test builds need no action — `debug_assertions` alone already
+# satisfies the same gate (see that binary's module doc).
+pov-fixtures = []
+
+[dev-dependencies]
+# The P4 offline-verifier integration test (`tests/offline_verify.rs`) reconstructs the frozen KAT
+# leaf set + decodes the expected root. `sha2`/`hex`/`serde_json` are also normal deps, but an
+# integration-test crate only sees the library's public API + dev-dependencies, so they are declared
+# here too.
+serde_json = "1"
+sha2 = { version = "0.10", features = ["oid"] }
+hex = "0.4"
+# R7 Task 3 — `tests/self_contained_verify.rs` builds a synthetic-but-cryptographically-real Rekor
+# co-anchor receipt (deterministic test P-256 keypair, self-signed checkpoint) to exercise the REAL
+# `coanchor::verify_coanchored` offline, because the crate's captured live fixture
+# (`rekor_coanchor_entry.json`) commits to a different root than the frozen KAT Merkle root (no real
+# Sigstore receipt exists for both at once). `p256` is already a normal optional dep (`rekor-verify`
+# feature); declared here too for the same reason as `sha2`/`hex`/`serde_json` above.
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+# R7 Task 4 — `tests/self_contained_verify.rs`'s bin e2e tests build a real proof-bundle zip
+# (`write_bundle_zip`) and shell out to `meshlogic_verify`; `tempfile` gives each test its own
+# scratch directory so parallel test runs never collide on the same zip path.
+tempfile = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[[bin]]
+name = "tamper_evidence_demo"
+required-features = ["tsa-client"]
+
+# ADR-043 C1 P4 — the zero-trust OFFLINE VERIFIER. Verifies a ProofBundle end-to-end (structural
+# inclusion+chain via `ProofBundle::verify` + full RFC 3161 TST CMS-signature/cert-chain crypto via
+# `anchor::verify_tst_full`) WITHOUT trusting MeshLogic and WITHOUT AWS/network. Gated on
+# `offline-verify`; the pure crypto lives in `anchor.rs` (unit-tested by CI when the feature is on).
+[[bin]]
+name = "commitment_proof_verify"
+required-features = ["offline-verify"]
+
+# ADR-043 C1 slice-1a — the ANCHOR half: verifies captured CommitmentLeaves (re-derivation),
+# builds the Merkle root + per-leaf inclusion proofs, RFC 3161-anchors the root, and emits the
+# committed auditor artifact. The network TSA round-trip needs `tsa-client`; the offline
+# re-derivation/inclusion/artifact logic lives in `commitment_leaf.rs` (default-features, so it is
+# unit-tested by the CI `cargo test`).
+[[bin]]
+name = "commitment_leaf_anchor"
+required-features = ["tsa-client"]
+
+# ADR-043 C1 P1b PR-2 — the auditor proof-generation CLI. DynamoDB roots-chain read + S3
+# commitment-leaf re-listing live behind `aws-reads`; the pure proof_gen library (default-features)
+# is unit-tested by the CI `cargo test`.
+[[bin]]
+name = "commitment_proof_gen"
+required-features = ["aws-reads"]
+
+# R7 Task 4 — the customer-facing zero-trust OFFLINE proof-bundle verifier. Reads a proof-bundle
+# zip (`self_contained::SelfContainedBundle` as its `bundle.json` entry), grades it via
+# `self_contained::verify_self_contained` against PINNED trust roots (no override flag — an
+# overridable root would defeat the anti-circularity guarantee), and prints a graded human report.
+# Gated on `offline-verify` (same gate as the crypto + zip reading it needs); NO AWS, NO network.
+[[bin]]
+name = "meshlogic_verify"
+required-features = ["offline-verify"]

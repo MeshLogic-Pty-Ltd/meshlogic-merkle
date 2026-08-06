@@ -1,0 +1,8 @@
+# The repo-root .gitignore ignores *.pem/*.der/*.crt for key hygiene. The files below are PUBLIC
+# freeTSA RFC 3161 test-vector certificates (a public CA root + its public TSA signing cert) — NOT
+# secrets — and are required committed test fixtures for the P4 offline verifier. Re-include exactly
+# these. See README.md for provenance.
+!freetsa_cacert.pem
+!freetsa_cacert.der
+!freetsa_tsa_leaf.crt
+!freetsa_tsa_leaf.der
