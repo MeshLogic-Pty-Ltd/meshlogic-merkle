@@ -72,6 +72,10 @@ pub mod decision_chain;
 #[cfg(any(feature = "offline-verify", feature = "leaf-verify"))]
 pub mod jcs;
 
+/// M6-c FROZEN v=1 decision-record canonicalization (the shared leaf content both agent producers +
+/// the verifier canonicalize identically). Needs only `serde_json` + `jcs`, so it is always available.
+pub mod decision_record;
+
 /// R7 — the self-contained proof-bundle types (`docs/superpowers/plans/2026-07-25-r7-proof-
 /// bundle.md`, Task 1): a customer-downloadable bundle wrapping `proof_gen::ProofBundle` +
 /// `coanchor::RekorReceipt` per evidence record/period, and the offline verifier's graded verdict
