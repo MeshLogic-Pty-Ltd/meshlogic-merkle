@@ -73,7 +73,8 @@ pub mod decision_chain;
 pub mod jcs;
 
 /// M6-c FROZEN v=1 decision-record canonicalization (the shared leaf content both agent producers +
-/// the verifier canonicalize identically). Needs only `serde_json` + `jcs`, so it is always available.
+/// the verifier canonicalize identically). Uses this crate's `jcs`, so it shares its feature gate.
+#[cfg(any(feature = "offline-verify", feature = "leaf-verify"))]
 pub mod decision_record;
 
 /// R7 — the self-contained proof-bundle types (`docs/superpowers/plans/2026-07-25-r7-proof-
