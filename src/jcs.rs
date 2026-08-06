@@ -24,7 +24,10 @@ const MAX_SAFE_INTEGER: u64 = (1u64 << 53) - 1;
 
 /// Deterministic RFC 8785 canonical bytes of `v`. Total and never panics: `serde_json` numbers are
 /// always finite, so the number path always yields a deterministic string.
-pub(crate) fn canonical_json_bytes(v: &Value) -> Vec<u8> {
+/// RFC 8785 (JCS) canonical JSON bytes of `v` — the ONE canon shared by the leaf-envelope signature,
+/// the M6-c decision-record preimage (built by each platform's agent), and MESHLOGIC03's independent
+/// verifier. Exposed so producers canonicalize the record IDENTICALLY across Windows + macOS.
+pub fn canonical_json_bytes(v: &Value) -> Vec<u8> {
     let mut out = String::new();
     serialize_value(v, &mut out);
     out.into_bytes()

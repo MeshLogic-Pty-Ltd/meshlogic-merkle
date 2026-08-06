@@ -70,7 +70,7 @@ pub mod decision_chain;
 /// consumer's name — gated on `any(...)` of both, so a plain no-features build carries no dead code
 /// and neither consumer's feature has to imply the other's (heavier) dependencies.
 #[cfg(any(feature = "offline-verify", feature = "leaf-verify"))]
-mod jcs;
+pub mod jcs;
 
 /// R7 — the self-contained proof-bundle types (`docs/superpowers/plans/2026-07-25-r7-proof-
 /// bundle.md`, Task 1): a customer-downloadable bundle wrapping `proof_gen::ProofBundle` +
