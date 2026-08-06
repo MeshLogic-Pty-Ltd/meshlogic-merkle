@@ -364,26 +364,42 @@ fn append_lock_for(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()
         .clone()
 }
 
-/// The locked, durable read-derive-append shared by the signed + unsigned public entry points. Holds
-/// the per-path append lock across load → derive → write so no second producer can interleave.
-fn locked_append(
+/// The locked, durable read-derive-BUILD-sign-append shared by the signed + unsigned entry points.
+/// Holds the per-path append lock across load → derive `seq` → build → sign → write so no second
+/// producer can interleave. Building INSIDE the lock is what lets us inject the chain position:
+/// `identity.event_sequence = seq` is set atomically, so the SIGNED leaf's identity always matches the
+/// row's `seq` (they cannot be derived independently — `seq` only exists once the tail is read).
+fn locked_build_append(
     path: &std::path::Path,
-    signed: &SignedCommitmentLeaf,
+    source_kind: &str,
+    canonical_preimage: &[u8],
+    mut identity: Value,
+    signer: Option<(&ed25519_dalek::SigningKey, &str)>,
 ) -> std::io::Result<DecisionChainRow> {
     let lock = append_lock_for(path);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
     let existing = load_chain_file(path)?;
     let (seq, prev_tip) = next_position(&existing);
-    let row = row_from_signed(seq, &prev_tip, signed);
+    // Stamp the chain position into the SIGNED identity (frozen schema: identity.event_sequence =
+    // chain_index). Only meaningful once `seq` is known, i.e. under the lock.
+    if let Value::Object(map) = &mut identity {
+        map.insert("event_sequence".to_string(), Value::from(seq));
+    }
+    let leaf = build_commitment_leaf(source_kind, canonical_preimage, identity);
+    let signed = match signer {
+        Some((signing_key, key_id)) => sign_leaf(leaf, signing_key, key_id),
+        None => SignedCommitmentLeaf::new(leaf, None),
+    };
+    let row = row_from_signed(seq, &prev_tip, &signed);
     write_row_line(path, &row)?;
     Ok(row)
 }
 
 /// Append ONE signed decision to the on-disk chain file, returning the new row (whose `chain_hash` is
-/// the new tip). Reads the existing chain to derive `seq` + `prev_tip`, builds+signs the leaf, and
-/// durably appends a single JSON line under the per-path append lock. `signing_key`/`key_id` are the
-/// ADR-062 enrolled per-agent identity — an UN-ENROLLED box uses [`append_unsigned_decision_to_file`]
-/// instead of a fixture (never fixture-sign a prod proof).
+/// the new tip). Reads the existing chain to derive `seq` + `prev_tip`, stamps `event_sequence = seq`
+/// into the identity, builds+signs the leaf, and durably appends a single JSON line under the per-path
+/// append lock. `signing_key`/`key_id` are the ADR-062 enrolled per-agent identity — an UN-ENROLLED box
+/// uses [`append_unsigned_decision_to_file`] instead of a fixture (never fixture-sign a prod proof).
 pub fn append_decision_to_file(
     path: &std::path::Path,
     source_kind: &str,
@@ -392,9 +408,13 @@ pub fn append_decision_to_file(
     signing_key: &ed25519_dalek::SigningKey,
     key_id: &str,
 ) -> std::io::Result<DecisionChainRow> {
-    let leaf = build_commitment_leaf(source_kind, canonical_preimage, identity);
-    let signed = sign_leaf(leaf, signing_key, key_id);
-    locked_append(path, &signed)
+    locked_build_append(
+        path,
+        source_kind,
+        canonical_preimage,
+        identity,
+        Some((signing_key, key_id)),
+    )
 }
 
 /// Append ONE UNSIGNED decision (honest un-enrolled path): the chain still re-derives, but the row
@@ -405,9 +425,7 @@ pub fn append_unsigned_decision_to_file(
     canonical_preimage: &[u8],
     identity: Value,
 ) -> std::io::Result<DecisionChainRow> {
-    let leaf = build_commitment_leaf(source_kind, canonical_preimage, identity);
-    let unsigned = SignedCommitmentLeaf::new(leaf, None);
-    locked_append(path, &unsigned)
+    locked_build_append(path, source_kind, canonical_preimage, identity, None)
 }
 
 /// Append a single row as one JSON line (with a trailing newline), then `fsync` so a power loss cannot
@@ -721,6 +739,39 @@ mod tests {
             verify_decision_chain(&loaded, DECISION_CHAIN_GENESIS, &trust_store(), 1, true)
                 .is_err()
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_stamps_event_sequence_equal_to_seq_and_signs_over_it() {
+        let path = temp_chain_path("event_seq");
+        let sk = fixture_signing_key();
+        for expected in 0..3u64 {
+            let row = append_decision_to_file(
+                &path,
+                "enforcement_decision",
+                b"{\"d\":1}",
+                // identity WITHOUT event_sequence — the crate stamps it under the lock.
+                json!({"endpoint_id":"ep","org_id":"org","event_class":"CooperationDecision","captured_at":1u64}),
+                &sk,
+                KEY_ID,
+            )
+            .unwrap();
+            assert_eq!(row.seq, expected);
+            // The SIGNED identity carries event_sequence == the row's seq (stamped atomically).
+            assert_eq!(row.identity["event_sequence"], json!(expected));
+        }
+        // The signature is over the leaf INCL. the injected event_sequence, so the whole chain still
+        // re-derives + verifies — proving the stamp is inside the signed envelope, not bolted on after.
+        let loaded = load_chain_file(&path).unwrap();
+        verify_decision_chain(
+            &loaded,
+            DECISION_CHAIN_GENESIS,
+            &trust_store(),
+            116_444_736_000_000_100,
+            true,
+        )
+        .expect("stamped chain must verify");
         let _ = std::fs::remove_file(&path);
     }
 
