@@ -270,12 +270,31 @@ impl std::error::Error for DecisionChainError {}
 /// expected tip — the external anchor (increment 2, RFC-3161 / Rekor) or a monotonic/TPM rewind counter,
 /// NOT the lake's asserted tip. This is exactly the honesty tier banked with MESHLOGIC03: 1a is
 /// tamper-evident WITHIN a trusted-boot session; robustness ACROSS host compromise gates on those pins.
-pub fn verify_decision_chain(
+/// GENERIC record-chain verify — the SAME linkage + content-hash + signature checks as
+/// [`verify_decision_chain`], with the DOMAIN PIN injected as `is_expected_source_kind`. Any leaf type on
+/// the shared generic chain (decisions, the ADR-025 offline-cache telemetry-batch WAL, a future record
+/// type) is verified through ONE primitive rather than a forked copy of the crypto — the only way the
+/// canon/hash/signature discipline can't drift between chains (ADR-176). The pin is the chain's domain
+/// gate: a row whose `source_kind` fails `is_expected_source_kind` is a cross-type splice, rejected
+/// FAIL-CLOSED INDEPENDENT of `require_signatures` (such a leaf may be validly signed by the SAME enrolled
+/// key — `source_kind` rides the signature but NOT the chain-link, so without the pin a signed foreign
+/// leaf would re-derive and pass (2)-(4)). Returns the verified tip. `expected_first_prev` is
+/// [`DECISION_CHAIN_GENESIS`] (the shared, record-agnostic genesis) for a from-genesis walk, or a trusted
+/// co-anchored checkpoint tip when an auditor walks forward.
+///
+/// # SECURITY
+/// `is_expected_source_kind` MUST be a TIGHT ALLOWLIST of exactly the domain(s) this chain carries
+/// (e.g. [`crate::decision_record::is_decision_source_kind`], or a cache-WAL's `is_offline_cache_leaf`).
+/// A permissive pin — above all `|_| true` — silently disables ALL cross-type replay protection while
+/// every other check stays green: a leaf of ANY domain, validly signed by the same enrolled key, would
+/// then re-derive and pass. The pin is the ONLY thing standing between two chains sharing this primitive.
+pub fn verify_record_chain<F: Fn(&str) -> bool>(
     rows: &[DecisionChainRow],
     expected_first_prev: &str,
     trust: &EnrolledAgentTrustStore,
     at_time: u64,
     require_signatures: bool,
+    is_expected_source_kind: F,
 ) -> Result<String, DecisionChainError> {
     use base64::Engine as _;
     if rows.is_empty() {
@@ -283,14 +302,13 @@ pub fn verify_decision_chain(
     }
     let mut prev_tip = expected_first_prev.to_string();
     for (i, row) in rows.iter().enumerate() {
-        // (0) DOMAIN PIN — the decision chain carries ONLY decision leaves. A row whose `source_kind` is
-        // not a decision domain (an offline-cache telemetry leaf, or any other record type sharing the
-        // generic chain primitive) is a cross-type splice and is rejected FAIL-CLOSED — independent of
-        // `require_signatures`, because such a leaf may be validly signed by the SAME enrolled key. This is
-        // the verifier pin the generic `record_chain`'s envelope-domain separation depends on: source_kind
-        // rides the signature but NOT the chain-link, so without this check a signed foreign leaf would
-        // re-derive and pass (2)–(4). See `record_chain` module docs.
-        if !crate::decision_record::is_decision_source_kind(&row.source_kind) {
+        // (0) DOMAIN PIN — the chain carries ONLY its own domain's leaves. A row whose `source_kind` fails
+        // the injected pin (a foreign leaf of another record type sharing the generic chain primitive) is a
+        // cross-type splice, rejected FAIL-CLOSED — independent of `require_signatures`, because such a leaf
+        // may be validly signed by the SAME enrolled key. This is the verifier pin the generic
+        // `record_chain`'s envelope-domain separation depends on: source_kind rides the signature but NOT
+        // the chain-link, so without this check a signed foreign leaf would re-derive and pass (2)-(4).
+        if !is_expected_source_kind(&row.source_kind) {
             return Err(DecisionChainError::ForeignSourceKind {
                 seq: row.seq,
                 source_kind: row.source_kind.clone(),
@@ -328,6 +346,26 @@ pub fn verify_decision_chain(
         prev_tip = row.chain_hash.clone();
     }
     Ok(prev_tip)
+}
+
+/// The decision chain is ONE domain on the generic [`verify_record_chain`]: it pins the decision source
+/// kinds ([`crate::decision_record::is_decision_source_kind`]) and is otherwise byte-identical to the
+/// pre-extraction verify (a foreign — e.g. offline-cache telemetry — leaf is rejected fail-closed).
+pub fn verify_decision_chain(
+    rows: &[DecisionChainRow],
+    expected_first_prev: &str,
+    trust: &EnrolledAgentTrustStore,
+    at_time: u64,
+    require_signatures: bool,
+) -> Result<String, DecisionChainError> {
+    verify_record_chain(
+        rows,
+        expected_first_prev,
+        trust,
+        at_time,
+        require_signatures,
+        crate::decision_record::is_decision_source_kind,
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -794,6 +832,85 @@ mod tests {
                 "require_signatures={require_sig}: foreign source_kind must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn verify_record_chain_pins_its_own_domain_symmetrically() {
+        // The generic verify accepts a NON-decision domain when the injected pin matches, and rejects a
+        // foreign leaf fail-closed — the mirror of `foreign_source_kind_is_rejected...`, proving the pin
+        // works in BOTH directions (a telemetry-pinned verify rejects a decision leaf just as the
+        // decision-pinned verify rejects a telemetry leaf). This is the property the offline-cache WAL
+        // verifier relies on: cross-type replay resistance on the SHARED chain primitive.
+        const WAL_KIND: &str = "meshlogic.offline-cache.telemetry-batch";
+        let sk = fixture_signing_key();
+
+        // Build a 2-row WAL (telemetry) chain, validly signed by the enrolled key.
+        let mut wal = Vec::new();
+        let mut prev = DECISION_CHAIN_GENESIS.to_string();
+        for seq in 0..2u64 {
+            let preimage = format!("[{{\"event_id\":{seq}}}]");
+            let leaf = crate::signed_leaf::build_commitment_leaf_with_spec(
+                WAL_KIND,
+                "MLCH-1",
+                preimage.as_bytes(),
+                identity(seq),
+            );
+            let signed = sign_leaf(leaf, &sk, KEY_ID);
+            let row = row_from_signed(seq, &prev, &signed);
+            prev = row.chain_hash.clone();
+            wal.push(row);
+        }
+
+        // (1) POSITIVE: the WAL-pinned generic verify accepts its own domain and re-derives the tip.
+        let tip = verify_record_chain(
+            &wal,
+            DECISION_CHAIN_GENESIS,
+            &trust_store(),
+            116_444_736_000_000_100,
+            true,
+            |sk| sk == WAL_KIND,
+        )
+        .expect("WAL chain must verify under its own domain pin");
+        assert_eq!(
+            tip,
+            wal.last().unwrap().chain_hash,
+            "re-derived tip == asserted tip"
+        );
+
+        // (2) NEGATIVE (the new symmetric direction): a DECISION chain, validly signed, is rejected
+        //     FAIL-CLOSED by a WAL-pinned verify — a decision leaf can never replay onto the WAL chain.
+        let decision = build_chain(2);
+        for require_sig in [false, true] {
+            assert_eq!(
+                verify_record_chain(
+                    &decision,
+                    DECISION_CHAIN_GENESIS,
+                    &trust_store(),
+                    116_444_736_000_000_100,
+                    require_sig,
+                    |sk| sk == WAL_KIND,
+                )
+                .unwrap_err(),
+                DecisionChainError::ForeignSourceKind {
+                    seq: 0,
+                    source_kind: "enforcement_decision".to_string(),
+                },
+                "require_signatures={require_sig}: a decision leaf must be rejected by the WAL pin"
+            );
+        }
+
+        // (3) And the delegating decision verify still rejects the WAL chain — symmetry both ways.
+        assert!(matches!(
+            verify_decision_chain(
+                &wal,
+                DECISION_CHAIN_GENESIS,
+                &trust_store(),
+                116_444_736_000_000_100,
+                true,
+            )
+            .unwrap_err(),
+            DecisionChainError::ForeignSourceKind { .. }
+        ));
     }
 
     fn temp_chain_path(tag: &str) -> std::path::PathBuf {
