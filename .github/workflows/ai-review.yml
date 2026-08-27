@@ -1,0 +1,73 @@
+name: AI Review
+
+# Calls the reusable AI review workflow hosted in
+# MeshLogic-Pty-Ltd/meshlogic-agent at the pinned v1 commit (NOT @main, NOT a
+# mutable tag). See https://github.com/MeshLogic-Pty-Ltd/meshlogic-agent/blob/main/docs/AI-REVIEW.md
+#
+# WHY THIS EXISTS: meshlogic-merkle holds the SHARED tamper-evidence crypto
+# (leaf/chain/JCS/verify) that the Windows agent, macOS agent, driver, and the
+# independent auditor are all byte-identical against. CI gates compile/test/clippy
+# but cannot reason about cross-file semantic patterns (e.g. a verifier that drops
+# a fail-closed pin, or a near-duplicate that diverges in safety). This crate was
+# the ONLY MeshLogic crate without the AI-review gate (meshlogic-common,
+# meshlogic-driver-windows, meshlogic-platform, MeshLogic-CLI all have it), so
+# every PR here shipped on manual review alone. This closes that gap.
+#
+# Requirements (org-level, already provisioned for sibling crates):
+# - meshlogic-ci-dependency-access GitHub App installed on this repo.
+# - Org-level secrets APP_ID + APP_PRIVATE_KEY visible to this repo.
+# - Org-level secret ANTHROPIC_API_KEY (AWS Secrets Manager meshlogic/anthropic-api-key).
+#
+# Severity gating (controlled by the reusable workflow):
+# - BLOCKING / HIGH   → AI Review Findings status check FAILS (blocks merge once required)
+# - MEDIUM / LOW / NIT → status check passes; comments are advisory
+#
+# Override (admin only): comment `/ai-review override <reason>` (write+ required).
+
+# SECURITY: top-level deny-all. This controls the CALLER's GITHUB_TOKEN scope;
+# the called job declares its own permissions and the effective set is the
+# intersection with the grants on the calling job below.
+permissions: {}
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Skip AI Review on docs-only PRs (saves Actions minutes).
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'CHANGELOG*'
+      - '.github/CODEOWNERS'
+  issue_comment:
+    types: [created]
+
+jobs:
+  ai-review:
+    # SECURITY: caller-level actor gate. `secrets: inherit` makes APP_PRIVATE_KEY
+    # + ANTHROPIC_API_KEY available as soon as the job is invoked, so we filter
+    # BEFORE invocation: any contributor's PR is reviewed, but the issue_comment
+    # override path is gated to org members / collaborators / repo owner so a
+    # non-org actor's comment can never invoke the called workflow (secrets never
+    # enter scope).
+    if: |
+      github.event_name == 'pull_request' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        startsWith(github.event.comment.body, '/ai-review override') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
+    # SHA-pinned to the v1 tag commit (c4c924d at 2026-08-27). Why SHA not @v1:
+    # this workflow gets `secrets: inherit`; a mutable tag is a supply-chain risk
+    # if repointed. Bump via:
+    #   gh api repos/MeshLogic-Pty-Ltd/meshlogic-agent/git/refs/tags/v1 --jq '.object.sha'
+    uses: MeshLogic-Pty-Ltd/meshlogic-agent/.github/workflows/ai-review.yml@c4c924de6850f9a4aa96c484cfe84c7159f436db
+    secrets: inherit
+    # These are the MAXIMUM permissions granted to the reusable workflow's
+    # GITHUB_TOKEN. Do NOT remove — the called workflow needs them to post the
+    # review comment + set the status check; without them the run startup-fails.
+    permissions:
+      pull-requests: write # post review comment
+      contents: read # checkout PR diff
+      statuses: write # post AI Review Findings status check
+      issues: read # read issue_comment payload (override)
