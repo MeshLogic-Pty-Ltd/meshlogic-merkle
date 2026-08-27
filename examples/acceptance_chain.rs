@@ -32,8 +32,26 @@ fn key_id_for(vk: &ed25519_dalek::VerifyingKey) -> String {
 }
 
 fn main() {
-    let outdir = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
-    let chain_path = std::path::Path::new(&outdir).join("cooperation-decisions.jsonl");
+    // An explicit output directory is REQUIRED — this example writes a chain signed with the PUBLIC
+    // golden-vector key, so it must never default to the cwd, and it must never use the production
+    // reader's filename (`cooperation-decisions.jsonl`). Both would risk a golden-key-signed artifact
+    // landing where a real reader picks it up.
+    let outdir = match std::env::args().nth(1) {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "usage: cargo run -p meshlogic-merkle --example acceptance_chain --features leaf-verify -- <outdir>\n\
+                 <outdir> is required (no cwd default): this writes a golden-key-signed acceptance chain."
+            );
+            std::process::exit(2);
+        }
+    };
+    // Example-specific filename — deliberately NOT the production `cooperation-decisions.jsonl` a
+    // deployed reader consumes.
+    let chain_path = std::path::Path::new(&outdir).join("acceptance-chain.jsonl");
+    if let Some(parent) = chain_path.parent() {
+        std::fs::create_dir_all(parent).expect("create outdir");
+    }
     let _ = std::fs::remove_file(&chain_path);
 
     // Frozen golden-vector identity: Win #562 == Mac #563 == evchain-verify.py all pin this exact key.
@@ -55,6 +73,9 @@ fn main() {
             actor_path: r"C:\Program Files\Claude\claude.exe",
             object_path: Some(r"C:\Users\a\.aws\credentials"),
             object_content_hash: None,
+            // canon-v2 fields (#3): None ⇒ these stay v=1 records, byte-identical to the frozen leaves.
+            object_file_id: None,
+            object_size: None,
         },
         DecisionRecord {
             event_id: 1002,
@@ -67,6 +88,9 @@ fn main() {
             actor_path: r"C:\Program Files\Claude\claude.exe",
             object_path: Some(r"C:\Users\a\.ssh\id_ed25519"),
             object_content_hash: None,
+            // canon-v2 fields (#3): None ⇒ these stay v=1 records, byte-identical to the frozen leaves.
+            object_file_id: None,
+            object_size: None,
         },
         DecisionRecord {
             event_id: 1003,
@@ -79,6 +103,9 @@ fn main() {
             actor_path: r"C:\Program Files\Claude\claude.exe",
             object_path: None, // actor-promotion has no file object → explicit null in the preimage
             object_content_hash: None,
+            // canon-v2 fields (#3): None ⇒ these stay v=1 records, byte-identical to the frozen leaves.
+            object_file_id: None,
+            object_size: None,
         },
     ];
 
@@ -128,5 +155,7 @@ fn main() {
         hex::encode(sk.verifying_key().as_bytes())
     );
     println!("leaf0_preimage  : {leaf0_preimage_hex}");
-    println!("\nHand to MESHLOGIC03: the chain_file, key_id -> pubkey_hex, and leaf0_preimage (HEX).");
+    println!(
+        "\nHand to MESHLOGIC03: the chain_file, key_id -> pubkey_hex, and leaf0_preimage (HEX)."
+    );
 }
