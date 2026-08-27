@@ -32,8 +32,8 @@ use serde_json::Value;
 
 use crate::commitment_leaf::sha256_hex;
 use crate::signed_leaf::{
-    build_commitment_leaf, sign_leaf, verify_leaf_signature, CommitmentLeaf,
-    EnrolledAgentTrustStore, LeafSigStatus, LeafSignature, SignedCommitmentLeaf,
+    build_commitment_leaf, build_commitment_leaf_with_spec, sign_leaf, verify_leaf_signature,
+    CommitmentLeaf, EnrolledAgentTrustStore, LeafSigStatus, LeafSignature, SignedCommitmentLeaf,
 };
 
 /// Genesis predecessor tip for the first row — the EMPTY string (matches the acceptance verifier's
@@ -211,6 +211,11 @@ pub enum DecisionChainError {
     SignatureUntrusted { seq: u64 },
     /// A row is unsigned (empty `sig_b64`) but signatures were REQUIRED for this verification.
     MissingSignature { seq: u64 },
+    /// The row's `source_kind` is not a decision domain ([`crate::decision_record::DECISION_SOURCE_KINDS`])
+    /// — a FOREIGN / cross-type leaf (e.g. an offline-cache telemetry-batch WAL leaf) spliced onto the
+    /// decision chain. Rejected fail-closed EVEN IF validly signed by the same enrolled key: the generic
+    /// record-chain's envelope-domain separation is only sound because the decision verifier pins here.
+    ForeignSourceKind { seq: u64, source_kind: String },
 }
 
 impl std::fmt::Display for DecisionChainError {
@@ -234,6 +239,12 @@ impl std::fmt::Display for DecisionChainError {
             SignatureUntrusted { seq } => write!(f, "seq {seq}: leaf signature did not verify"),
             MissingSignature { seq } => {
                 write!(f, "seq {seq}: unsigned row but signatures required")
+            }
+            ForeignSourceKind { seq, source_kind } => {
+                write!(
+                    f,
+                    "seq {seq}: foreign source_kind {source_kind:?} on a decision chain (cross-type leaf)"
+                )
             }
         }
     }
@@ -272,6 +283,19 @@ pub fn verify_decision_chain(
     }
     let mut prev_tip = expected_first_prev.to_string();
     for (i, row) in rows.iter().enumerate() {
+        // (0) DOMAIN PIN — the decision chain carries ONLY decision leaves. A row whose `source_kind` is
+        // not a decision domain (an offline-cache telemetry leaf, or any other record type sharing the
+        // generic chain primitive) is a cross-type splice and is rejected FAIL-CLOSED — independent of
+        // `require_signatures`, because such a leaf may be validly signed by the SAME enrolled key. This is
+        // the verifier pin the generic `record_chain`'s envelope-domain separation depends on: source_kind
+        // rides the signature but NOT the chain-link, so without this check a signed foreign leaf would
+        // re-derive and pass (2)–(4). See `record_chain` module docs.
+        if !crate::decision_record::is_decision_source_kind(&row.source_kind) {
+            return Err(DecisionChainError::ForeignSourceKind {
+                seq: row.seq,
+                source_kind: row.source_kind.clone(),
+            });
+        }
         // (1) contiguity — a gap or reorder is a possible silently-deleted decision.
         if row.seq != i as u64 {
             return Err(DecisionChainError::NotContiguous { seq: row.seq });
@@ -372,6 +396,7 @@ fn append_lock_for(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()
 fn locked_build_append(
     path: &std::path::Path,
     source_kind: &str,
+    canon_spec_version: &str,
     canonical_preimage: &[u8],
     mut identity: Value,
     signer: Option<(&ed25519_dalek::SigningKey, &str)>,
@@ -385,7 +410,12 @@ fn locked_build_append(
     if let Value::Object(map) = &mut identity {
         map.insert("event_sequence".to_string(), Value::from(seq));
     }
-    let leaf = build_commitment_leaf(source_kind, canonical_preimage, identity);
+    let leaf = build_commitment_leaf_with_spec(
+        source_kind,
+        canon_spec_version,
+        canonical_preimage,
+        identity,
+    );
     let signed = match signer {
         Some((signing_key, key_id)) => sign_leaf(leaf, signing_key, key_id),
         None => SignedCommitmentLeaf::new(leaf, None),
@@ -408,12 +438,65 @@ pub fn append_decision_to_file(
     signing_key: &ed25519_dalek::SigningKey,
     key_id: &str,
 ) -> std::io::Result<DecisionChainRow> {
+    // Decision leaves are canonicalized under MLCH-1 (the frozen decision-record spec). Delegates to the
+    // spec-aware generic append; the "MLCH-1" here keeps decision rows byte-identical to pre-generic.
     locked_build_append(
         path,
         source_kind,
+        "MLCH-1",
         canonical_preimage,
         identity,
         Some((signing_key, key_id)),
+    )
+}
+
+/// GENERIC signed-leaf append — the ONE shared tamper-evidence primitive (ADR-025 / ADR-176) under both
+/// the decision chain and the offline-cache WAL. Same lock/seq-derivation/`event_sequence`-stamp/fsync
+/// durability as [`append_decision_to_file`], but the caller supplies the record's STAMPED
+/// `canon_spec_version` (so a verifier re-derives each leaf under its own spec) and the signed-ENVELOPE
+/// `source_kind` domain tag (the cross-type replay boundary — a verifier MUST pin its expected value).
+/// The typed, trait-based entry point is [`crate::record_chain::append_record_to_file`]. Returns the new
+/// row whose `chain_hash` is the tip.
+///
+/// LAYOUT: write each `source_kind`'s records to their OWN chain file (a decision file, a telemetry-WAL
+/// file — distinct lifecycles). A foreign `source_kind` spliced onto a DECISION-chain file is rejected by
+/// [`verify_decision_chain`]'s domain pin, so this cannot silently corrupt decision verification — but
+/// one-domain-per-file is the intended layout, not a suggestion.
+pub fn append_leaf_to_file(
+    path: &std::path::Path,
+    source_kind: &str,
+    canon_spec_version: &str,
+    canonical_preimage: &[u8],
+    identity: Value,
+    signing_key: &ed25519_dalek::SigningKey,
+    key_id: &str,
+) -> std::io::Result<DecisionChainRow> {
+    locked_build_append(
+        path,
+        source_kind,
+        canon_spec_version,
+        canonical_preimage,
+        identity,
+        Some((signing_key, key_id)),
+    )
+}
+
+/// The honest UN-ENROLLED generic append (mirror of [`append_unsigned_decision_to_file`]): re-derivable
+/// chain, no signature, so `tamper_evident` stays honestly false upstream. Never fixture-signs.
+pub fn append_unsigned_leaf_to_file(
+    path: &std::path::Path,
+    source_kind: &str,
+    canon_spec_version: &str,
+    canonical_preimage: &[u8],
+    identity: Value,
+) -> std::io::Result<DecisionChainRow> {
+    locked_build_append(
+        path,
+        source_kind,
+        canon_spec_version,
+        canonical_preimage,
+        identity,
+        None,
     )
 }
 
@@ -425,7 +508,14 @@ pub fn append_unsigned_decision_to_file(
     canonical_preimage: &[u8],
     identity: Value,
 ) -> std::io::Result<DecisionChainRow> {
-    locked_build_append(path, source_kind, canonical_preimage, identity, None)
+    locked_build_append(
+        path,
+        source_kind,
+        "MLCH-1",
+        canonical_preimage,
+        identity,
+        None,
+    )
 }
 
 /// Append a single row as one JSON line (with a trailing newline), then `fsync` so a power loss cannot
@@ -665,6 +755,45 @@ mod tests {
             DecisionChainError::MissingSignature { seq: 0 }
         );
         let _ = sk;
+    }
+
+    #[test]
+    fn foreign_source_kind_is_rejected_even_when_validly_signed() {
+        // A telemetry (offline-cache WAL) leaf VALIDLY SIGNED BY THE ENROLLED KEY, spliced onto a decision
+        // chain: it re-derives (content_hash + hash-link) and its signature is TRUSTED — yet the domain pin
+        // rejects it FAIL-CLOSED for BOTH require_signatures values. This is the cross-type replay the
+        // generic record_chain's envelope-domain separation relies on the decision verifier to catch; the
+        // MED an independent review flagged (documented obligation vs. enforced check).
+        let sk = fixture_signing_key();
+        let leaf = crate::signed_leaf::build_commitment_leaf_with_spec(
+            "meshlogic.offline-cache.telemetry-batch",
+            "MLCH-1",
+            b"[{\"e\":1}]",
+            identity(0),
+        );
+        let signed = sign_leaf(leaf, &sk, KEY_ID);
+        let row = row_from_signed(0, DECISION_CHAIN_GENESIS, &signed);
+        assert!(
+            !row.sig_b64.is_empty(),
+            "row is validly signed by the enrolled key"
+        );
+        for require_sig in [false, true] {
+            assert_eq!(
+                verify_decision_chain(
+                    std::slice::from_ref(&row),
+                    DECISION_CHAIN_GENESIS,
+                    &trust_store(),
+                    116_444_736_000_000_100,
+                    require_sig,
+                )
+                .unwrap_err(),
+                DecisionChainError::ForeignSourceKind {
+                    seq: 0,
+                    source_kind: "meshlogic.offline-cache.telemetry-batch".to_string(),
+                },
+                "require_signatures={require_sig}: foreign source_kind must be rejected"
+            );
+        }
     }
 
     fn temp_chain_path(tag: &str) -> std::path::PathBuf {
