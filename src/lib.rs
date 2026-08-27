@@ -273,11 +273,20 @@ mod tests {
     use serde_json::Value;
 
     fn corpus() -> Value {
-        let path = concat!(
+        // Vendored in the standalone repo (self-contained CI); falls back to the monorepo location
+        // when this crate is built nested in meshlogic-platform/crates/meshlogic-merkle. The corpus is
+        // FROZEN (the exact S3 conformance vectors), so the vendored copy does not drift by design.
+        let vendored = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/conformance/merkle-anchor/vectors.json"
+        );
+        let nested = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/conformance/merkle-anchor/vectors.json"
         );
-        let raw = std::fs::read_to_string(path).expect("read merkle corpus");
+        let raw = std::fs::read_to_string(vendored)
+            .or_else(|_| std::fs::read_to_string(nested))
+            .expect("read merkle corpus (vendored or monorepo)");
         serde_json::from_str(&raw).expect("parse merkle corpus")
     }
 
