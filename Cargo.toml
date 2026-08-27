@@ -162,3 +162,7 @@ required-features = ["aws-reads"]
 [[bin]]
 name = "meshlogic_verify"
 required-features = ["offline-verify"]
+
+[[example]]
+name = "acceptance_chain"
+required-features = ["leaf-verify"]
