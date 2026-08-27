@@ -281,6 +281,13 @@ impl std::error::Error for DecisionChainError {}
 /// leaf would re-derive and pass (2)-(4)). Returns the verified tip. `expected_first_prev` is
 /// [`DECISION_CHAIN_GENESIS`] (the shared, record-agnostic genesis) for a from-genesis walk, or a trusted
 /// co-anchored checkpoint tip when an auditor walks forward.
+///
+/// # SECURITY
+/// `is_expected_source_kind` MUST be a TIGHT ALLOWLIST of exactly the domain(s) this chain carries
+/// (e.g. [`crate::decision_record::is_decision_source_kind`], or a cache-WAL's `is_offline_cache_leaf`).
+/// A permissive pin — above all `|_| true` — silently disables ALL cross-type replay protection while
+/// every other check stays green: a leaf of ANY domain, validly signed by the same enrolled key, would
+/// then re-derive and pass. The pin is the ONLY thing standing between two chains sharing this primitive.
 pub fn verify_record_chain<F: Fn(&str) -> bool>(
     rows: &[DecisionChainRow],
     expected_first_prev: &str,
