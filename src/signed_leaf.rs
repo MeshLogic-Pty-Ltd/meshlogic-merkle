@@ -486,11 +486,30 @@ pub fn build_commitment_leaf(
     canonical_preimage: &[u8],
     identity: Value,
 ) -> CommitmentLeaf {
+    // MLCH-1 shorthand for the decision-chain path — byte-identical to the frozen v=1 leaf. The generic
+    // record-chain path (ADR-025 / ADR-176) calls `build_commitment_leaf_with_spec` so each record carries
+    // its own STAMPED canon spec rather than this hardcoded default.
+    build_commitment_leaf_with_spec(source_kind, "MLCH-1", canonical_preimage, identity)
+}
+
+/// Generalized leaf builder: `canon_spec_version` is the RECORD's stamped canonicalization spec (e.g.
+/// "MLCH-1"), not a hardcoded constant — so ONE chain primitive can carry records under different
+/// canonicalizations and an independent verifier re-derives EACH leaf under its own stamped spec
+/// (canonicalize-by-stamped-version). Identical to [`build_commitment_leaf`] in every other respect
+/// (`content_hash = sha256(canonical_preimage)`, raw preimage carried base64 for re-derivation); the
+/// caller JCS-canonicalizes the record BEFORE calling this. `source_kind` is the signed-ENVELOPE domain
+/// tag — the cross-type replay boundary a verifier pins its expected value against.
+pub fn build_commitment_leaf_with_spec(
+    source_kind: impl Into<String>,
+    canon_spec_version: impl Into<String>,
+    canonical_preimage: &[u8],
+    identity: Value,
+) -> CommitmentLeaf {
     use base64::Engine as _;
     CommitmentLeaf {
         leaf_version: "1".to_string(),
         content_hash: crate::commitment_leaf::sha256_hex(canonical_preimage),
-        canon_spec_version: "MLCH-1".to_string(),
+        canon_spec_version: canon_spec_version.into(),
         source_kind: source_kind.into(),
         canonical_preimage_b64: base64::engine::general_purpose::STANDARD
             .encode(canonical_preimage),

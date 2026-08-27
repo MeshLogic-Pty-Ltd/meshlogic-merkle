@@ -32,8 +32,8 @@ use serde_json::Value;
 
 use crate::commitment_leaf::sha256_hex;
 use crate::signed_leaf::{
-    build_commitment_leaf, sign_leaf, verify_leaf_signature, CommitmentLeaf,
-    EnrolledAgentTrustStore, LeafSigStatus, LeafSignature, SignedCommitmentLeaf,
+    build_commitment_leaf, build_commitment_leaf_with_spec, sign_leaf, verify_leaf_signature,
+    CommitmentLeaf, EnrolledAgentTrustStore, LeafSigStatus, LeafSignature, SignedCommitmentLeaf,
 };
 
 /// Genesis predecessor tip for the first row — the EMPTY string (matches the acceptance verifier's
@@ -372,6 +372,7 @@ fn append_lock_for(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()
 fn locked_build_append(
     path: &std::path::Path,
     source_kind: &str,
+    canon_spec_version: &str,
     canonical_preimage: &[u8],
     mut identity: Value,
     signer: Option<(&ed25519_dalek::SigningKey, &str)>,
@@ -385,7 +386,12 @@ fn locked_build_append(
     if let Value::Object(map) = &mut identity {
         map.insert("event_sequence".to_string(), Value::from(seq));
     }
-    let leaf = build_commitment_leaf(source_kind, canonical_preimage, identity);
+    let leaf = build_commitment_leaf_with_spec(
+        source_kind,
+        canon_spec_version,
+        canonical_preimage,
+        identity,
+    );
     let signed = match signer {
         Some((signing_key, key_id)) => sign_leaf(leaf, signing_key, key_id),
         None => SignedCommitmentLeaf::new(leaf, None),
@@ -408,12 +414,60 @@ pub fn append_decision_to_file(
     signing_key: &ed25519_dalek::SigningKey,
     key_id: &str,
 ) -> std::io::Result<DecisionChainRow> {
+    // Decision leaves are canonicalized under MLCH-1 (the frozen decision-record spec). Delegates to the
+    // spec-aware generic append; the "MLCH-1" here keeps decision rows byte-identical to pre-generic.
     locked_build_append(
         path,
         source_kind,
+        "MLCH-1",
         canonical_preimage,
         identity,
         Some((signing_key, key_id)),
+    )
+}
+
+/// GENERIC signed-leaf append — the ONE shared tamper-evidence primitive (ADR-025 / ADR-176) under both
+/// the decision chain and the offline-cache WAL. Same lock/seq-derivation/`event_sequence`-stamp/fsync
+/// durability as [`append_decision_to_file`], but the caller supplies the record's STAMPED
+/// `canon_spec_version` (so a verifier re-derives each leaf under its own spec) and the signed-ENVELOPE
+/// `source_kind` domain tag (the cross-type replay boundary — a verifier MUST pin its expected value).
+/// The typed, trait-based entry point is [`crate::record_chain::append_record_to_file`]. Returns the new
+/// row whose `chain_hash` is the tip.
+pub fn append_leaf_to_file(
+    path: &std::path::Path,
+    source_kind: &str,
+    canon_spec_version: &str,
+    canonical_preimage: &[u8],
+    identity: Value,
+    signing_key: &ed25519_dalek::SigningKey,
+    key_id: &str,
+) -> std::io::Result<DecisionChainRow> {
+    locked_build_append(
+        path,
+        source_kind,
+        canon_spec_version,
+        canonical_preimage,
+        identity,
+        Some((signing_key, key_id)),
+    )
+}
+
+/// The honest UN-ENROLLED generic append (mirror of [`append_unsigned_decision_to_file`]): re-derivable
+/// chain, no signature, so `tamper_evident` stays honestly false upstream. Never fixture-signs.
+pub fn append_unsigned_leaf_to_file(
+    path: &std::path::Path,
+    source_kind: &str,
+    canon_spec_version: &str,
+    canonical_preimage: &[u8],
+    identity: Value,
+) -> std::io::Result<DecisionChainRow> {
+    locked_build_append(
+        path,
+        source_kind,
+        canon_spec_version,
+        canonical_preimage,
+        identity,
+        None,
     )
 }
 
@@ -425,7 +479,14 @@ pub fn append_unsigned_decision_to_file(
     canonical_preimage: &[u8],
     identity: Value,
 ) -> std::io::Result<DecisionChainRow> {
-    locked_build_append(path, source_kind, canonical_preimage, identity, None)
+    locked_build_append(
+        path,
+        source_kind,
+        "MLCH-1",
+        canonical_preimage,
+        identity,
+        None,
+    )
 }
 
 /// Append a single row as one JSON line (with a trailing newline), then `fsync` so a power loss cannot

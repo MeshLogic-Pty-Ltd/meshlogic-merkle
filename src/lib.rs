@@ -64,6 +64,14 @@ pub mod signed_leaf;
 #[cfg(feature = "leaf-verify")]
 pub mod decision_chain;
 
+/// GENERIC record chain (ADR-025 / ADR-176) — the ONE shared tamper-evidence primitive. A [`LeafRecord`]
+/// yields (`source_kind`, `canon_spec_version`, `canonical_preimage`); [`record_chain::append_record_to_file`]
+/// hash-links + signs it onto a chain file exactly like the decision chain, returning the new
+/// [`record_chain::ChainHead`]. `decision_record::DecisionRecord` is one such leaf type; the offline-cache
+/// telemetry-batch WAL (ADR-025) is another. Same `leaf-verify` gate as the signing machinery it uses.
+#[cfg(feature = "leaf-verify")]
+pub mod record_chain;
+
 /// RFC 8785 (JCS) canonical-JSON serialisation — the ONE shared implementation of the MLCH-1 canon
 /// family, reused by [`signed_leaf`]'s leaf-envelope canon and R7's [`self_contained`] proof-bundle
 /// signing canon, so the two can never independently drift. Not itself feature-gated on either
