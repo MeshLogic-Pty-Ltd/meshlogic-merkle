@@ -178,9 +178,51 @@ mod tests {
         assert_eq!(decision_leaf.identity, generic_leaf.identity);
     }
 
+    /// END-TO-END row identity (the actual safety property, not just the unsigned leaf): the SAME
+    /// DecisionRecord appended via `append_record_to_file` (generic path) and via
+    /// `decision_chain::append_decision_to_file` (decision path) produces a BYTE-IDENTICAL on-disk row —
+    /// signature, under-lock `event_sequence` stamp, and `chain_hash` included. (Ed25519 is deterministic,
+    /// so identical signed bytes ⇒ identical signature.) This closes the "byte-identical row" gate an
+    /// independent review flagged; leaf-level equality alone did not exercise sign/stamp/link.
+    #[test]
+    fn append_record_to_file_equals_append_decision_to_file_byte_for_byte() {
+        use crate::decision_chain::{append_decision_to_file, load_chain_file};
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let key_id = "kid-e2e";
+        let rec = sample();
+        let id = identity();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pa = dir.path().join("decision.jsonl");
+        let pb = dir.path().join("generic.jsonl");
+
+        let row_decision = append_decision_to_file(
+            &pa,
+            source_kind_for(rec.rule_kind),
+            &dr_canonical_preimage(&rec),
+            id.clone(),
+            &sk,
+            key_id,
+        )
+        .expect("decision append");
+        let head_generic =
+            append_record_to_file(&pb, &rec, id, &sk, key_id).expect("generic append");
+
+        // ChainHead matches the decision row's (seq, tip)…
+        assert_eq!(head_generic.seq, row_decision.seq);
+        assert_eq!(head_generic.chain_hash, row_decision.chain_hash);
+        // …and the FULL persisted row is byte-identical (DecisionChainRow: PartialEq over every field).
+        let rows_generic = load_chain_file(&pb).expect("load generic");
+        assert_eq!(rows_generic.len(), 1);
+        assert_eq!(
+            rows_generic[0], row_decision,
+            "generic append produced a different row than the decision append for the same record"
+        );
+    }
+
     /// A non-decision record (mimics the ADR-025 telemetry-batch WAL leaf) carries its OWN envelope
-    /// source_kind + its own canon spec, and its content_hash is independent of the decision leaf — the
-    /// cross-type separation the verifier pin relies on.
+    /// source_kind + its own canon spec, and its content_hash is independent of the decision leaf. The
+    /// actual REJECTION of such a leaf spliced onto a decision chain is proven by
+    /// `decision_chain::tests::foreign_source_kind_is_rejected_even_when_validly_signed` (the verifier pin).
     #[test]
     fn generic_record_carries_its_own_envelope_domain() {
         struct BatchRec;

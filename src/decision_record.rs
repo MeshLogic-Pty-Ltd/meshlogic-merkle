@@ -54,6 +54,21 @@ pub fn source_kind_for(rule_kind: &str) -> &'static str {
     }
 }
 
+/// The COMPLETE set of `source_kind` values a decision leaf can carry (the full range of
+/// [`source_kind_for`]). A decision-chain verifier pins against THIS set: a row whose `source_kind` is not
+/// one of these is a FOREIGN / cross-type leaf (e.g. an offline-cache telemetry-batch WAL leaf) and must
+/// be rejected even when validly signed by the same enrolled key — the envelope-domain separation the
+/// generic [`crate::record_chain`] relies on is only sound with that verifier pin. Keep in lockstep with
+/// `source_kind_for` (a `#[test]` below asserts every `source_kind_for` output is a member).
+pub const DECISION_SOURCE_KINDS: [&str; 2] = ["enforcement_decision", "cooperation_decision"];
+
+/// True iff `source_kind` is one a decision leaf legitimately carries ([`DECISION_SOURCE_KINDS`]). The
+/// decision-chain verifier ([`crate::decision_chain::verify_decision_chain`]) rejects any row for which
+/// this is false — cross-type replay resistance, enforced (not just documented).
+pub fn is_decision_source_kind(source_kind: &str) -> bool {
+    DECISION_SOURCE_KINDS.contains(&source_kind)
+}
+
 /// The decision record as a JSON value (JCS sorts keys at canon time; `Option` → `null`).
 ///
 /// VERSION-SELECTED object shape (ratified canon-v2): a record carrying INTRINSIC OBJECT IDENTITY
@@ -247,5 +262,21 @@ mod tests {
             "v2 with null file_id: {s}"
         );
         assert!(s.ends_with(r#""v":2}"#));
+    }
+
+    // Drift guard: every value `source_kind_for` can return MUST be a member of DECISION_SOURCE_KINDS, so
+    // the verifier's domain pin can never reject a legitimate decision leaf. "policy" and any other
+    // rule_kind cover both arms of `source_kind_for`.
+    #[test]
+    fn source_kind_for_outputs_are_all_decision_source_kinds() {
+        for rk in ["policy", "behavioural", "anything-else"] {
+            assert!(
+                is_decision_source_kind(source_kind_for(rk)),
+                "source_kind_for({rk:?}) not in DECISION_SOURCE_KINDS — the verifier pin would reject a real leaf"
+            );
+        }
+        assert!(!is_decision_source_kind(
+            "meshlogic.offline-cache.telemetry-batch"
+        ));
     }
 }
