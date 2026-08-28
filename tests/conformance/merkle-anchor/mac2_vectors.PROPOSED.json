@@ -1,0 +1,47 @@
+{
+  "_STATUS": "PROPOSED — NEEDS windows-master DESIGN CONCURRENCE before finalisation/merge (charter HARD RULE 5)",
+  "_finding": "A1 (CRITICAL) — roots-chain links not cryptographically committed",
+  "digest_preimage": "SHA256( domain || be64(len(org_id)) || org_id || be64(period_id) || be64(tree_size) || root_hash || prev_chain_digest )",
+  "domain_separation_tag_ascii": "meshlogic.mac.rootschain.v2\u0000",
+  "domain_separation_tag_hex": "6d6573686c6f6769632e6d61632e726f6f7473636861696e2e763200",
+  "genesis_chain_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "head_chain_digest": "96ed0559304f9efe5d699678c1a5f23f9603cefea4dfa75b81169fc8df127a4b",
+  "org_id": "org-acme",
+  "rows": [
+    {
+      "algorithm": "RFC6962-SHA256",
+      "canon": "MAC-2",
+      "chain_digest": "0c5a04e533be3ebdee7fbade84859534b67d84cf0a2ba833533b6263698b519d",
+      "org_id": "org-acme",
+      "period_id": 0,
+      "prev_chain_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "prev_root_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "root_hash": "35b5f2709beff9c7b55f267051ed89309cd899d79ad4ac205ff77ce8eeb65859",
+      "tree_size": 2
+    },
+    {
+      "algorithm": "RFC6962-SHA256",
+      "canon": "MAC-2",
+      "chain_digest": "e2582a54401917c67e402664cdb01afeb215e596c3107a2b7722ba04e7179a54",
+      "org_id": "org-acme",
+      "period_id": 1,
+      "prev_chain_digest": "0c5a04e533be3ebdee7fbade84859534b67d84cf0a2ba833533b6263698b519d",
+      "prev_root_hash": "35b5f2709beff9c7b55f267051ed89309cd899d79ad4ac205ff77ce8eeb65859",
+      "root_hash": "5fb58d89ca9e40abece0d6b1447d5783094112244c17e9b5b7aa5c89c84f8012",
+      "tree_size": 3
+    },
+    {
+      "algorithm": "RFC6962-SHA256",
+      "canon": "MAC-2",
+      "chain_digest": "96ed0559304f9efe5d699678c1a5f23f9603cefea4dfa75b81169fc8df127a4b",
+      "org_id": "org-acme",
+      "period_id": 2,
+      "prev_chain_digest": "e2582a54401917c67e402664cdb01afeb215e596c3107a2b7722ba04e7179a54",
+      "prev_root_hash": "5fb58d89ca9e40abece0d6b1447d5783094112244c17e9b5b7aa5c89c84f8012",
+      "root_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tree_size": 0
+    }
+  ],
+  "spec_version": "MAC-2",
+  "tree_algorithm": "RFC6962-SHA256"
+}

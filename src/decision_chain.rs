@@ -405,32 +405,110 @@ pub fn next_position(existing_rows: &[DecisionChainRow]) -> (u64, String) {
     (existing_rows.len() as u64, tip(existing_rows))
 }
 
-/// Process-wide per-path append locks. The read-derive-append below is a strict data dependency (each
-/// row's `seq`/`prev_tip` derive from the current tail), so two threads racing it would both compute the
-/// SAME `seq`/`prev_tip` and write a divergent pair the verifier rejects at the contiguity gate — AFTER
-/// the corruption is on disk. This serialises appends to a given chain file WITHIN the process. The
-/// single-agent-per-box deployment invariant covers the cross-PROCESS case; a genuine multi-instance
-/// producer would additionally need an OS advisory lock (`flock`/`fs2`) — tracked for that day, not 1a.
+/// Process-wide per-path append locks (the fast-path IN-PROCESS layer). The read-derive-append below
+/// is a strict data dependency (each row's `seq`/`prev_tip` derive from the current tail), so two
+/// threads racing it would both compute the SAME `seq`/`prev_tip` and write a divergent pair the
+/// verifier rejects at the contiguity gate — AFTER the corruption is on disk. This mutex serialises
+/// appends to a given chain file WITHIN the process; the OS advisory lock ([`OsAppendLock`]) layered
+/// under it serialises across PROCESSES (A3 remediation).
+///
+/// A3 (path aliases): the map is keyed on the CANONICALISED path ([`canonical_lock_key`]), NOT the raw
+/// `&Path`. Two spellings of the same file within one process — `foo.jsonl` vs `./foo.jsonl` vs an
+/// absolute path vs a symlink vs a Windows case variant — previously resolved to DIFFERENT map keys →
+/// different mutexes → no mutual exclusion, defeating even the in-process guarantee. Canonicalising the
+/// key coalesces every alias to ONE mutex.
 static APPEND_LOCKS: std::sync::LazyLock<
     std::sync::Mutex<
         std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
     >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-fn append_lock_for(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+/// Resolve `path` to a canonical key so different spellings of the same file coalesce to one lock.
+///
+/// The chain file may not exist yet (first append on a fresh box), so we canonicalise the PARENT
+/// directory (creating it first, as the append will) and re-attach the file name — `std::fs::canonicalize`
+/// resolves `.`/`..`/symlinks and, on Windows, normalises the drive/prefix; we additionally lowercase on
+/// Windows so case-insensitive aliases coalesce. Falls back to the raw path if the parent cannot be
+/// canonicalised (the lock is then merely no-worse-than the pre-fix behaviour for that one call).
+fn canonical_lock_key(path: &std::path::Path) -> std::path::PathBuf {
+    let (Some(parent), Some(name)) = (
+        path.parent().filter(|p| !p.as_os_str().is_empty()),
+        path.file_name(),
+    ) else {
+        return path.to_path_buf();
+    };
+    let _ = std::fs::create_dir_all(parent);
+    match std::fs::canonicalize(parent) {
+        Ok(cp) => {
+            let key = cp.join(name);
+            if cfg!(windows) {
+                std::path::PathBuf::from(key.to_string_lossy().to_lowercase())
+            } else {
+                key
+            }
+        }
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+fn append_lock_for(canonical_key: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()>> {
     APPEND_LOCKS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .entry(path.to_path_buf())
+        .entry(canonical_key.to_path_buf())
         .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
         .clone()
 }
 
+/// The lock-sidecar path for a chain file: `<chain-file>.lock`. A dedicated sidecar (rather than
+/// locking the chain file's own handle) keeps the advisory lock independent of the separate read/append
+/// handles `load_chain_file`/`write_row_line` open, so acquiring it can never interfere with them.
+fn lock_sidecar_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".lock");
+    std::path::PathBuf::from(s)
+}
+
+/// An OS-backed EXCLUSIVE advisory lock over a chain file's sidecar (A3 remediation) — `flock` on Unix,
+/// `LockFileEx` on Windows (via `fs2`). Held across the whole read-tail -> derive -> append transaction
+/// and released on drop, so a genuine multi-instance producer (a second process, a migration/repair
+/// tool) can no longer interleave two appends and write duplicate `seq` / a divergent tip. Because the
+/// lock is on the file object, two SPELLINGS of the same sidecar resolve to the same underlying file and
+/// still mutually exclude, layered under the canonicalised in-process mutex.
+struct OsAppendLock {
+    _file: std::fs::File,
+}
+
+impl OsAppendLock {
+    /// Acquire (blocking) the exclusive OS lock on `path`'s sidecar, creating the parent + sidecar if
+    /// absent. The lock is released when the returned guard is dropped.
+    fn acquire(path: &std::path::Path) -> std::io::Result<Self> {
+        use fs2::FileExt as _;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_sidecar_path(path))?;
+        file.lock_exclusive()?; // blocks until the cross-process lock is held; released on drop
+        Ok(Self { _file: file })
+    }
+}
+
 /// The locked, durable read-derive-BUILD-sign-append shared by the signed + unsigned entry points.
-/// Holds the per-path append lock across load → derive `seq` → build → sign → write so no second
-/// producer can interleave. Building INSIDE the lock is what lets us inject the chain position:
-/// `identity.event_sequence = seq` is set atomically, so the SIGNED leaf's identity always matches the
-/// row's `seq` (they cannot be derived independently — `seq` only exists once the tail is read).
+///
+/// Holds TWO layered locks across load → derive `seq` → build → sign → write so no second producer can
+/// interleave (A3 remediation): (1) the CANONICALISED in-process mutex ([`append_lock_for`] /
+/// [`canonical_lock_key`]) — a fast path that also coalesces path-alias spellings within the process;
+/// (2) the OS-backed exclusive advisory lock ([`OsAppendLock`]) — cross-PROCESS serialisation for a
+/// genuine multi-instance producer. The tail is (re)read ONLY AFTER BOTH locks are held, so the
+/// `seq`/`prev_tip` a racing appender would have computed against a stale tail can never be written.
+/// Building INSIDE the lock is what lets us inject the chain position: `identity.event_sequence = seq`
+/// is set atomically, so the SIGNED leaf's identity always matches the row's `seq` (they cannot be
+/// derived independently — `seq` only exists once the tail is read under the lock).
 fn locked_build_append(
     path: &std::path::Path,
     source_kind: &str,
@@ -439,8 +517,12 @@ fn locked_build_append(
     mut identity: Value,
     signer: Option<(&ed25519_dalek::SigningKey, &str)>,
 ) -> std::io::Result<DecisionChainRow> {
-    let lock = append_lock_for(path);
+    // (1) In-process fast path, keyed on the CANONICAL path so aliases coalesce to one mutex.
+    let lock = append_lock_for(&canonical_lock_key(path));
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    // (2) Cross-process OS advisory lock, held for the rest of this transaction (released on drop).
+    let _os_guard = OsAppendLock::acquire(path)?;
+    // Reread the tail AFTER both locks are held — the derive must see the freshest on-disk state.
     let existing = load_chain_file(path)?;
     let (seq, prev_tip) = next_position(&existing);
     // Stamp the chain position into the SIGNED identity (frozen schema: identity.event_sequence =
@@ -1180,5 +1262,102 @@ mod tests {
         assert_eq!(ch.len(), 64);
         assert_ne!(ch, SHA256_EMPTY);
         assert_ne!(ch, "0".repeat(64));
+    }
+
+    // ---- A3 remediation: path-alias coalescing + OS-backed cross-process lock -------------------
+
+    /// A3 (path aliases): appending through two DIFFERENT SPELLINGS of the SAME file, from many
+    /// threads, must still produce a strictly-increasing, contiguous, verifier-clean chain. Before the
+    /// fix the raw-path lock key mapped the two spellings to different in-process mutexes → no mutual
+    /// exclusion → duplicate `seq`/divergent tip. The canonicalised key (and the OS lock on the shared
+    /// sidecar inode) coalesce them.
+    #[test]
+    fn path_alias_spellings_serialize_to_one_contiguous_chain() {
+        let base = temp_chain_path("alias");
+        let parent = base.parent().unwrap().to_path_buf();
+        let name = base.file_name().unwrap().to_os_string();
+        std::fs::create_dir_all(parent.join("sub")).unwrap();
+        // Spelling A: the plain path. Spelling B: the SAME file reached via `sub/..` — a DISTINCT
+        // `PathBuf` map key (the `..` component is retained by `PathBuf` equality, unlike a `.`, which
+        // is normalised away — so the OLD raw-path lock key genuinely mapped these to different
+        // mutexes), yet the same file on disk once `..` is resolved.
+        let alias_a = base.clone();
+        let alias_b = parent.join("sub").join("..").join(&name);
+        assert_ne!(
+            alias_a, alias_b,
+            "the two spellings must be distinct PathBuf keys (retained `..` component)"
+        );
+
+        let n = 16u64;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let p = if i % 2 == 0 {
+                    alias_a.clone()
+                } else {
+                    alias_b.clone()
+                };
+                std::thread::spawn(move || {
+                    let sk = fixture_signing_key();
+                    let preimage = format!("{{\"decision\":\"block\",\"t\":{i}}}");
+                    append_decision_to_file(
+                        &p,
+                        "enforcement_decision",
+                        preimage.as_bytes(),
+                        identity(i),
+                        &sk,
+                        KEY_ID,
+                    )
+                    .expect("aliased append must succeed");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let loaded = load_chain_file(&alias_a).unwrap();
+        assert_eq!(
+            loaded.len() as u64,
+            n,
+            "every append via EITHER spelling landed exactly once (no alias-induced race)"
+        );
+        for (i, row) in loaded.iter().enumerate() {
+            assert_eq!(row.seq, i as u64, "seq must be a clean contiguous 0..N");
+        }
+        verify_decision_chain(
+            &loaded,
+            DECISION_CHAIN_GENESIS,
+            &trust_store(),
+            116_444_736_000_000_100,
+            true,
+        )
+        .expect("alias-appended chain must re-derive contiguously");
+        let _ = std::fs::remove_file(&alias_a);
+        let _ = std::fs::remove_file(super::lock_sidecar_path(&alias_a));
+    }
+
+    /// A3 (cross-process): the OS advisory lock is genuinely EXCLUSIVE — a second acquisition of the
+    /// same chain file's lock BLOCKS until the first is released. Two separate `OsAppendLock::acquire`
+    /// calls open separate handles (modelling two processes), so this exercises the real OS lock, not
+    /// the in-process mutex. The second acquire must not complete until the first guard is dropped.
+    #[test]
+    fn os_append_lock_blocks_until_released() {
+        let path = temp_chain_path("oslock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let first = super::OsAppendLock::acquire(&path).expect("first lock");
+        let path2 = path.clone();
+        let handle = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let _second = super::OsAppendLock::acquire(&path2).expect("second lock");
+            start.elapsed()
+        });
+        // Hold the first lock for a clear margin, then release it.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(first);
+        let waited = handle.join().unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "the second OS-lock acquire must block until the first releases (waited only {waited:?})"
+        );
+        let _ = std::fs::remove_file(super::lock_sidecar_path(&path));
     }
 }

@@ -36,6 +36,14 @@ pub mod chain_verify;
 /// proof (`ProofBundle`) for a leaf's `content_hash`, consumable by `chain_verify`'s verifiers.
 pub mod proof_gen;
 
+/// A1 (CRITICAL) remediation — MAC-2 COMMITTED roots-chain: folds `org_id`/`period_id`/`tree_size`/
+/// `root_hash`/`C_{P-1}` into a per-row committed digest `C_P` (the value co-anchored, not the bare
+/// root), so witnessing the head transitively witnesses every prior period and proofs bind to
+/// org/period. ⚠ NEW canon + regenerated frozen vectors — NEEDS windows-master design concurrence
+/// before the production producer cuts over (charter HARD RULE 5); ships ALONGSIDE the untouched
+/// MAC-1 path, gated on `canon`.
+pub mod committed_chain;
+
 /// ADR-043 C1 P4 — the offline auditor's FULL RFC 3161 TST cryptographic verifier (`verify_tst_full`):
 /// CMS SignerInfo signature + X.509 chain-to-trusted-root. Feature-gated (`offline-verify`) so the
 /// shared Merkle/producer core stays dependency-light. Re-exported at `anchor::` for the API surface.

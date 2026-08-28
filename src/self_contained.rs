@@ -15,7 +15,7 @@
 //! NOT_YET_WITNESSED / NOT_YET_ANCHORED / UNTRUSTED_KEY / MALFORMED).
 
 use crate::anchor::verify_tst_full;
-use crate::coanchor::{verify_coanchored, CoAnchorStatus, RekorReceipt, RekorTrustStore};
+use crate::coanchor::{verify_coanchored_at, CoAnchorStatus, RekorReceipt, RekorTrustStore};
 use crate::commitment_leaf::sha256_hex;
 use crate::proof_gen::ProofBundle;
 use base64::Engine as _;
@@ -44,6 +44,15 @@ const B64: base64::engine::general_purpose::GeneralPurpose =
 /// (task 3, [`verify_self_contained`] + [`BundleTrustStore`]). `signer_fingerprint_sha256` is kept
 /// for now (a later task in that workstream removes it once the producer moves to KMS signing).
 pub const BUNDLE_SCHEMA: &str = "meshlogic.proof-bundle.v2";
+
+/// A4 remediation: the allow-list of bundle schema versions THIS verifier understands.
+/// [`verify_self_contained`] fails the WHOLE bundle closed (`Malformed`) for anything else — a
+/// forward/unknown `schema` is NEVER graded as if its fields carried the current version's semantics
+/// (version-confusion). The `schema` field is already inside [`SelfContainedBundle::canonical_signing_bytes`]
+/// (so a signed bundle can't flip it), but that only stops external forgery — it does NOT make a
+/// genuine future-schema bundle safe to grade under today's field assumptions. Extend this list
+/// deliberately, only when a new schema's field semantics are actually supported here.
+pub const KNOWN_BUNDLE_SCHEMAS: &[&str] = &[BUNDLE_SCHEMA];
 
 /// Domain-separation tag for [`SelfContainedBundle::canonical_signing_bytes`] — the same hygiene as
 /// `signed_leaf::LEAF_SIG_DOMAIN`: binds the signature to THIS protocol so it can never be replayed as
@@ -416,6 +425,40 @@ fn grade_record(
         );
     }
 
+    // 2.6 ORG COHERENCE (A4-ii remediation): the carried proof must be for the SAME org the bundle
+    //     declares. Because the roots chain can aggregate multiple orgs (and, pre-A1, `org_id` is not
+    //     yet folded into the committed root), a validly-anchored leaf from a DIFFERENT org would
+    //     otherwise grade PROVEN inside a bundle labelled `org_id = A` — genuine cross-org confusion.
+    //     This is the verifier-side coherence check the R7 "verify without trusting MeshLogic's
+    //     assembly" thesis requires; the cryptographic org-in-root binding it complements is the A1
+    //     MAC-2 committed digest (`committed_chain`, NEEDS windows-master concurrence).
+    if parsed.org_id != bundle.org_id {
+        return (
+            RecordVerdict::Altered,
+            format!(
+                "{}: proof is for org {:?} but the bundle declares {:?} — cross-org proof (coherence \
+                 violation)",
+                record.record_id, parsed.org_id, bundle.org_id
+            ),
+        );
+    }
+
+    // 2.7 PERIOD COHERENCE (A4-ii remediation): the bundle pins ONE as-of checkpoint
+    //     (`pinned_period_id`); every record must be provable as-of that checkpoint, i.e. anchored at
+    //     a period <= the pin. A record whose proof is anchored at a LATER period than the declared
+    //     checkpoint cannot be witnessed by it — the "every record provable as-of ONE fixed
+    //     checkpoint" guarantee is violated, so grade `Malformed` rather than let it pass silently.
+    if parsed.period_id > bundle.pinned_period_id {
+        return (
+            RecordVerdict::Malformed,
+            format!(
+                "{}: proof period {} is beyond the bundle's pinned checkpoint period {} — the \
+                 as-of checkpoint cannot witness it (coherence violation)",
+                record.record_id, parsed.period_id, bundle.pinned_period_id
+            ),
+        );
+    }
+
     // 3. Leaf re-derive: the auditor re-derivation `commitment_leaf` performs
     //    (`sha256_hex(base64_decode(preimage))` must equal the declared content_hash). Applied
     //    directly here rather than via `commitment_leaf::load_and_verify_leaf`, because that
@@ -490,18 +533,22 @@ fn grade_record(
             )
         }
     };
-    if let Err(e) = verify_tst_full(&der, parsed.inclusion.period_root, trusted_tsa_roots) {
-        // This task does not split WHICH TST failures are MALFORMED vs merely not-yet-witnessed
-        // (design spec defers that finer grading); NotYetWitnessed here is the fail-CLOSED
-        // choice — a TST that fails to verify never grades PROVEN.
-        return (
-            RecordVerdict::NotYetWitnessed,
-            format!(
-                "{}: TST for period {} did not verify ({e})",
-                record.record_id, parsed.period_id
-            ),
-        );
-    }
+    let verified_tst = match verify_tst_full(&der, parsed.inclusion.period_root, trusted_tsa_roots)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // This task does not split WHICH TST failures are MALFORMED vs merely not-yet-witnessed
+            // (design spec defers that finer grading); NotYetWitnessed here is the fail-CLOSED
+            // choice — a TST that fails to verify never grades PROVEN.
+            return (
+                RecordVerdict::NotYetWitnessed,
+                format!(
+                    "{}: TST for period {} did not verify ({e})",
+                    record.record_id, parsed.period_id
+                ),
+            );
+        }
+    };
 
     // 6. External Rekor co-anchor witness (Task 3): inclusion + chain-linkage + a genuinely-verified
     //    TST is MeshLogic's OWN signature on its OWN copy of the evidence — it never rules out
@@ -519,11 +566,18 @@ fn grade_record(
         // Rekor entries-response. Parse it with the matching inverse; a parse failure yields None →
         // graded the honest NotYetWitnessed below, never a softened Proven.
         .and_then(|v| RekorReceipt::from_receipt_json(v).ok());
-    match verify_coanchored(
+    // A2 remediation: bind the Rekor receipt's attacker-chosen `integrated_time` to the AUTHENTICATED
+    // RFC 3161 TST `gen_time` we JUST cryptographically verified for this same period root (step 5).
+    // `integrated_time` is not part of the signed checkpoint text, so on its own it must not select
+    // which pinned key validates the receipt; cross-checking it against the verified TST time refuses
+    // a fabricated old-looking time chosen to land inside a retired key's window
+    // (`verify_coanchored_at` → `IntegratedTimeUnauthenticated`, graded the honest NotYetWitnessed).
+    match verify_coanchored_at(
         parsed.inclusion.period_root,
         parsed.period_id,
         receipt.as_ref(),
         rekor_trust,
+        verified_tst.gen_time_unix,
     ) {
         CoAnchorStatus::CoAnchored { .. } => (
             RecordVerdict::Proven,
@@ -737,6 +791,29 @@ pub fn verify_self_contained(
     rekor_trust: &RekorTrustStore,
     bundle_trust: &BundleTrustStore,
 ) -> BundleVerdict {
+    // A4 remediation: FAIL-CLOSED schema gate — the verifier's documented "first sanity check"
+    // (`BUNDLE_SCHEMA` / the `schema` field doc), now actually enforced. An unknown/unsupported
+    // `schema` grades the WHOLE bundle `Malformed` BEFORE the signature gate or any per-record work,
+    // so a future bundle whose field semantics changed is never silently mis-graded under this
+    // verifier's assumptions. (`schema` is inside the signed bytes, so this is version-confusion
+    // defence, not external-forgery defence — see `KNOWN_BUNDLE_SCHEMAS`.)
+    if !KNOWN_BUNDLE_SCHEMAS.contains(&bundle.schema.as_str()) {
+        let note = format!(
+            "unsupported bundle schema {:?} (known: {:?}) — whole bundle rejected fail-closed",
+            bundle.schema, KNOWN_BUNDLE_SCHEMAS
+        );
+        let per_record = bundle
+            .records
+            .iter()
+            .map(|r| (r.record_id.clone(), RecordVerdict::Malformed))
+            .collect();
+        return BundleVerdict {
+            overall: RecordVerdict::Malformed,
+            per_record,
+            notes: vec![note],
+        };
+    }
+
     if let Err((verdict, note)) = verify_bundle_signature(bundle, bundle_trust, trusted_tsa_roots) {
         let per_record = bundle
             .records
