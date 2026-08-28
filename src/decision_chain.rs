@@ -405,6 +405,85 @@ pub fn next_position(existing_rows: &[DecisionChainRow]) -> (u64, String) {
     (existing_rows.len() as u64, tip(existing_rows))
 }
 
+/// The next `(seq, prev_tip)` derived from the LAST row alone — the O(1) equivalent of
+/// [`next_position`] that never needs the whole chain. `DecisionChainRow.seq` is CONTIGUOUS by
+/// construction (the append lock serialises appends and the verifier's contiguity gate enforces seq
+/// monotonicity), so `next_seq = last.seq + 1` and `prev_tip = last.chain_hash`; an empty chain →
+/// `(0, GENESIS)`. Produces the IDENTICAL `(seq, prev_tip)` [`next_position`] does for a valid chain
+/// (windows-master DRI-concurred), so the append output is byte-identical — a pure perf change.
+pub fn next_position_from_last(last: Option<&DecisionChainRow>) -> (u64, String) {
+    match last {
+        Some(r) => (r.seq + 1, r.chain_hash.clone()),
+        None => (0, DECISION_CHAIN_GENESIS.to_string()),
+    }
+}
+
+/// Bytes of the file tail scanned to find the last complete row without loading the whole file. A single
+/// leaf line — even a large offline-cache-WAL batch leaf — is well under this; only a pathological
+/// single line larger than the window falls back to a full [`load_chain_file`].
+const LAST_ROW_TAIL_BYTES: u64 = 1024 * 1024;
+
+/// Read the LAST COMPLETE (`'\n'`-terminated) row from a chain file WITHOUT loading the whole file — the
+/// O(1) tail read that replaces a full [`load_chain_file`] on the append hot path (a 479MB offline-cache
+/// WAL drove the daemon to 6-12GB RSS because every append re-read+parsed the whole chain). A TRAILING
+/// INCOMPLETE line (a crash mid-append can leave a truncated final line) is skipped — the append then
+/// continues from the last COMPLETE leaf and the verify pass is the backstop for the truncated fragment.
+/// `Ok(None)` = empty/missing chain (→ genesis).
+fn read_last_row(path: &std::path::Path) -> std::io::Result<Option<DecisionChainRow>> {
+    read_last_row_with_tail(path, LAST_ROW_TAIL_BYTES)
+}
+
+fn read_last_row_with_tail(
+    path: &std::path::Path,
+    tail_bytes: u64,
+) -> std::io::Result<Option<DecisionChainRow>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    let start = len.saturating_sub(tail_bytes);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    // `split('\n')`: a trailing '\n' yields a final "" segment, a non-'\n' end yields the INCOMPLETE
+    // trailing fragment. Dropping the final segment handles BOTH — leaving only '\n'-terminated
+    // (complete) lines. A truncated FIRST segment (the tail may start mid-line) is irrelevant: we take
+    // the LAST complete line.
+    let mut segs: Vec<&str> = text.split('\n').collect();
+    segs.pop();
+    let last = match segs.iter().rev().find(|l| !l.trim().is_empty()) {
+        Some(l) => *l,
+        None => {
+            // No complete line in the window. If we did not read from the file start, the last line may
+            // extend before `start` (a single >tail_bytes line) — fall back to the authoritative full
+            // read. If we read from start, the file has no complete line → empty chain.
+            return if start > 0 {
+                Ok(load_chain_file(path)?.pop())
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    match serde_json::from_str::<DecisionChainRow>(last) {
+        Ok(row) => Ok(Some(row)),
+        // A mid-file tail can truncate the FRONT of the last line (line > window) → parse fails → the full
+        // read is authoritative. Read from the file start ⇒ the line is genuinely corrupt: hard-error,
+        // matching load_chain_file's fail-closed-on-corruption behaviour.
+        Err(_) if start > 0 => Ok(load_chain_file(path)?.pop()),
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("corrupt decision-chain tail line: {e}"),
+        )),
+    }
+}
+
 /// Process-wide per-path append locks (the fast-path IN-PROCESS layer). The read-derive-append below
 /// is a strict data dependency (each row's `seq`/`prev_tip` derive from the current tail), so two
 /// threads racing it would both compute the SAME `seq`/`prev_tip` and write a divergent pair the
@@ -522,9 +601,13 @@ fn locked_build_append(
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
     // (2) Cross-process OS advisory lock, held for the rest of this transaction (released on drop).
     let _os_guard = OsAppendLock::acquire(path)?;
-    // Reread the tail AFTER both locks are held — the derive must see the freshest on-disk state.
-    let existing = load_chain_file(path)?;
-    let (seq, prev_tip) = next_position(&existing);
+    // Reread the tail AFTER both locks are held — the derive must see the freshest on-disk state. O(1):
+    // read only the LAST row for (seq, prev_tip) instead of loading+parsing the whole chain, so append
+    // cost does not grow with chain length (the 6-12GB-RSS root cause on a 479MB WAL). Byte-identical
+    // output for a valid chain (windows-master DRI-concurred); the append lock + verify pass remain the
+    // integrity backstops.
+    let last = read_last_row(path)?;
+    let (seq, prev_tip) = next_position_from_last(last.as_ref());
     // Stamp the chain position into the SIGNED identity (frozen schema: identity.event_sequence =
     // chain_index). Only meaningful once `seq` is known, i.e. under the lock.
     if let Value::Object(map) = &mut identity {
@@ -1359,5 +1442,122 @@ mod tests {
             "the second OS-lock acquire must block until the first releases (waited only {waited:?})"
         );
         let _ = std::fs::remove_file(super::lock_sidecar_path(&path));
+    }
+
+    // ── O(1) append: read_last_row / next_position_from_last ─────────────────────────────────────
+
+    #[test]
+    fn read_last_row_empty_and_missing_are_none() {
+        let path = temp_chain_path("lastrow_empty");
+        assert!(
+            read_last_row(&path).unwrap().is_none(),
+            "missing file → None (genesis)"
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            read_last_row(&path).unwrap().is_none(),
+            "empty file → None (genesis)"
+        );
+        // next_position_from_last(None) matches next_position(&[]) exactly.
+        assert_eq!(next_position_from_last(None), next_position(&[]));
+    }
+
+    #[test]
+    fn read_last_row_equals_load_chain_last_and_positions_match() {
+        let path = temp_chain_path("lastrow_match");
+        let sk = fixture_signing_key();
+        for seq in 0..5u64 {
+            append_decision_to_file(
+                &path,
+                "enforcement_decision",
+                format!("{{\"decision\":\"block\",\"seq\":{seq}}}").as_bytes(),
+                identity(seq),
+                &sk,
+                KEY_ID,
+            )
+            .unwrap();
+        }
+        let full = load_chain_file(&path).unwrap();
+        let last = read_last_row(&path)
+            .unwrap()
+            .expect("non-empty chain has a last row");
+        assert_eq!(
+            &last,
+            full.last().unwrap(),
+            "tail read == the full-load last row"
+        );
+        // The O(1) position is byte-identical to the O(n) one — same seq, same prev_tip.
+        assert_eq!(next_position_from_last(Some(&last)), next_position(&full));
+        assert_eq!(
+            next_position_from_last(Some(&last)).0,
+            5,
+            "next seq = last.seq + 1"
+        );
+    }
+
+    #[test]
+    fn read_last_row_skips_a_trailing_incomplete_line() {
+        // A crash mid-append can leave a truncated final line (no trailing '\n'). read_last_row must skip
+        // it and return the last COMPLETE leaf, so the next append continues from a sound tip.
+        let path = temp_chain_path("lastrow_partial");
+        let sk = fixture_signing_key();
+        for seq in 0..3u64 {
+            append_decision_to_file(
+                &path,
+                "enforcement_decision",
+                format!("{{\"decision\":\"block\",\"seq\":{seq}}}").as_bytes(),
+                identity(seq),
+                &sk,
+                KEY_ID,
+            )
+            .unwrap();
+        }
+        let complete_last = read_last_row(&path).unwrap().unwrap();
+        // Append a truncated JSON fragment WITHOUT a trailing newline.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"{\"seq\":3,\"hash\":\"trunc").unwrap();
+        let after = read_last_row(&path).unwrap().unwrap();
+        assert_eq!(
+            after, complete_last,
+            "the truncated trailing fragment is skipped → last COMPLETE leaf"
+        );
+        assert_eq!(
+            next_position_from_last(Some(&after)).0,
+            3,
+            "next seq derives from the complete tail (seq 2 + 1)"
+        );
+    }
+
+    #[test]
+    fn read_last_row_is_a_bounded_tail_read_not_a_whole_file_load() {
+        // With a TINY tail window, read_last_row still finds the last complete line on a multi-line file —
+        // proving it reads only the tail, not the whole chain (the O(1) property). A leaf line here is
+        // ~a few hundred bytes; a 512-byte tail spans the last line + its preceding '\n'.
+        let path = temp_chain_path("lastrow_bounded");
+        let sk = fixture_signing_key();
+        for seq in 0..8u64 {
+            append_decision_to_file(
+                &path,
+                "enforcement_decision",
+                format!("{{\"decision\":\"block\",\"seq\":{seq}}}").as_bytes(),
+                identity(seq),
+                &sk,
+                KEY_ID,
+            )
+            .unwrap();
+        }
+        let full_last = load_chain_file(&path).unwrap().pop().unwrap();
+        let tail_last = read_last_row_with_tail(&path, 512)
+            .unwrap()
+            .expect("tiny tail still finds it");
+        assert_eq!(
+            tail_last, full_last,
+            "a 512-byte tail read == the whole-file last row"
+        );
     }
 }
