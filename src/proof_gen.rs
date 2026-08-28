@@ -75,6 +75,10 @@ pub struct BundleChainRow {
     pub period_id: u64,
     pub root_hash: Hash,
     pub prev_root_hash: Hash,
+    /// The RFC 6962 Merkle root over the period's leaves (MAC-1: == `root_hash`; MAC-2: the inner value
+    /// folded into `root_hash`). Carried so the verifier can recompute the MAC-2 digest and bind the
+    /// inclusion proof to it.
+    pub period_root: Hash,
     pub tree_size: usize,
     pub algorithm: String,
     pub canon: String,
@@ -87,6 +91,7 @@ impl BundleChainRow {
             period_id: r.period_id,
             root_hash: r.root_hash,
             prev_root_hash: r.prev_root_hash,
+            period_root: r.period_root,
             tree_size: r.tree_size,
             algorithm: r.algorithm.to_string(),
             canon: r.canon.to_string(),
@@ -99,6 +104,7 @@ impl BundleChainRow {
             period_id: self.period_id,
             root_hash: self.root_hash,
             prev_root_hash: self.prev_root_hash,
+            period_root: self.period_root,
             tree_size: self.tree_size,
             algorithm: &self.algorithm,
             canon: &self.canon,
@@ -280,7 +286,9 @@ pub fn build_proof_bundle(
         .iter()
         .find(|r| r.period_id == period_id)
         .ok_or(ProofError::PeriodNotInChain(period_id))?;
-    if period_row.root_hash != inclusion.period_root {
+    // Bind the inclusion to the row's INNER Merkle root (== root_hash for MAC-1; the folded digest's
+    // committed inner value for MAC-2) — the value the audit path reproduces.
+    if period_row.period_root != inclusion.period_root {
         return Err(ProofError::RootMismatch { period_id });
     }
     if period_row.tree_size != inclusion.tree_size {
@@ -327,7 +335,7 @@ impl ProofBundle {
             .iter()
             .find(|r| r.period_id == self.period_id)
             .ok_or(ProofError::PeriodNotInChain(self.period_id))?;
-        if period_row.root_hash != self.inclusion.period_root {
+        if period_row.period_root != self.inclusion.period_root {
             return Err(ProofError::RootMismatch {
                 period_id: self.period_id,
             });
@@ -418,6 +426,7 @@ impl ProofBundle {
                 "period_id": r.period_id,
                 "root_hash": hex::encode(r.root_hash),
                 "prev_root_hash": hex::encode(r.prev_root_hash),
+                "period_root": hex::encode(r.period_root),
                 "tree_size": r.tree_size,
                 "algorithm": r.algorithm,
                 "canon": r.canon,
@@ -479,10 +488,19 @@ impl ProofBundle {
             .ok_or_else(|| MerkleError("roots_chain: expected array".into()))?
             .iter()
             .map(|r| {
+                let root_hash = hx(&r["root_hash"], "row.root_hash")?;
+                // MAC-1 back-compat: a bundle produced before the `period_root` field existed carries
+                // only `root_hash`, which for MAC-1 IS the period Merkle root — default to it.
+                let period_root = if r.get("period_root").is_some() {
+                    hx(&r["period_root"], "row.period_root")?
+                } else {
+                    root_hash
+                };
                 Ok(BundleChainRow {
                     period_id: u(&r["period_id"], "row.period_id")?,
-                    root_hash: hx(&r["root_hash"], "row.root_hash")?,
+                    root_hash,
                     prev_root_hash: hx(&r["prev_root_hash"], "row.prev_root_hash")?,
+                    period_root,
                     tree_size: u(&r["tree_size"], "row.tree_size")? as usize,
                     algorithm: s(&r["algorithm"], "row.algorithm")?,
                     canon: s(&r["canon"], "row.canon")?,

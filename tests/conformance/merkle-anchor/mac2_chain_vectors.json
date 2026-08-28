@@ -1,0 +1,39 @@
+{
+  "_note": "MAC-2 committed roots-chain golden vectors — windows-master DRI-concurred (2026-08-28). MAC-1 vectors.json is FROZEN and unchanged.",
+  "digest_preimage": "SHA256( domain || be64(period_id) || prev_root_hash || period_root )",
+  "domain_separation_tag_hex": "6d6573686c6f6769632e6d61632e726f6f7473636861696e2e763200",
+  "finding": "A1 (CRITICAL) — roots-chain links not cryptographically committed",
+  "genesis_prev_root": "0000000000000000000000000000000000000000000000000000000000000000",
+  "head_root_hash": "3d816ebac69943bf720c9432510408f0157a7e885c6bf5230991e609ba6d65a7",
+  "rows": [
+    {
+      "algorithm": "RFC6962-SHA256",
+      "canon": "MAC-2",
+      "period_id": 0,
+      "period_root": "35b5f2709beff9c7b55f267051ed89309cd899d79ad4ac205ff77ce8eeb65859",
+      "prev_root_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "root_hash": "2d21796751ad83f31a7edd7f3bbd39cc4e7388c2c1def7fa3d36e278b7ef346a",
+      "tree_size": 2
+    },
+    {
+      "algorithm": "RFC6962-SHA256",
+      "canon": "MAC-2",
+      "period_id": 1,
+      "period_root": "5fb58d89ca9e40abece0d6b1447d5783094112244c17e9b5b7aa5c89c84f8012",
+      "prev_root_hash": "2d21796751ad83f31a7edd7f3bbd39cc4e7388c2c1def7fa3d36e278b7ef346a",
+      "root_hash": "6dda52597c9565ed79dcb8f1958a24e9e096d2186501956ef8112f329b25edc7",
+      "tree_size": 3
+    },
+    {
+      "algorithm": "RFC6962-SHA256",
+      "canon": "MAC-2",
+      "period_id": 2,
+      "period_root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "prev_root_hash": "6dda52597c9565ed79dcb8f1958a24e9e096d2186501956ef8112f329b25edc7",
+      "root_hash": "3d816ebac69943bf720c9432510408f0157a7e885c6bf5230991e609ba6d65a7",
+      "tree_size": 0
+    }
+  ],
+  "spec_version": "MAC-2",
+  "tree_algorithm": "RFC6962-SHA256"
+}
