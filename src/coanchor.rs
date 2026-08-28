@@ -507,14 +507,37 @@ pub enum AnchoredOnlyReason {
     /// These trust/config states, all NOT crypto failures, are graded here (distinct from
     /// [`ReceiptInvalid`](Self::ReceiptInvalid), which implies possible tamper):
     ///
-    /// - no pinned key covers its `log_id` at its `integrated_time` (e.g. a key-rotation lag);
+    /// - no pinned key covers its `log_id` at its `integrated_time` (e.g. a key-rotation lag, OR the
+    ///   named key has been REVOKED for compromise — [`RekorTrustKey::revoked`], A2 hard-deny);
     /// - the selected pinned key does not actually belong to that `log_id`
     ///   (`SHA-256(DER(pinned key)) != log_id`) — a mis-pinned trust store;
     /// - the checkpoint's ORIGIN line does not match the pinned key's expected `origin` — the
     ///   checkpoint declares a different log/shard than the one we pinned trust for (cross-log /
     ///   cross-shard confusion).
     RekorKeyUntrusted,
+    /// A2 remediation: an AUTHENTICATED as-of time was supplied ([`verify_coanchored_at`]) and the
+    /// receipt's self-asserted `integrated_time` diverges from it by more than
+    /// [`MAX_INTEGRATED_TIME_SKEW_SECS`]. `integrated_time` is attacker-chosen (it is NOT part of the
+    /// signed checkpoint text), so it must never by itself select which pinned key validates a
+    /// receipt; when the caller can supply an authenticated time (e.g. the crate's own verified RFC
+    /// 3161 TST `gen_time` for the same root), a wildly-divergent `integrated_time` is refused rather
+    /// than trusted. A trust decision, NOT a crypto-signature failure — so graded here, not
+    /// [`ReceiptInvalid`](Self::ReceiptInvalid).
+    IntegratedTimeUnauthenticated {
+        /// The receipt's self-asserted (unauthenticated) integration time.
+        claimed: u64,
+        /// The caller-supplied authenticated as-of time it was checked against.
+        authenticated: u64,
+    },
 }
+
+/// A2 remediation: the maximum tolerated divergence (seconds) between a receipt's self-asserted
+/// `integrated_time` and a caller-supplied AUTHENTICATED as-of time before [`verify_coanchored_at`]
+/// refuses to grade `CoAnchored`. Rekor integration normally trails the RFC 3161 timestamp of the
+/// same root by seconds-to-minutes; a day of slack is comfortably permissive for honest clock/queue
+/// skew while still refusing an attacker's fabricated old-looking time chosen to land inside a
+/// retired key's window.
+pub const MAX_INTEGRATED_TIME_SKEW_SECS: u64 = 86_400;
 
 /// The GRADED co-anchor status of a roots-chain root (mac-lead ratified Q4 — graded, not binary).
 ///
@@ -570,12 +593,25 @@ pub struct RekorTrustKey {
     pub not_before: Option<u64>,
     /// Inclusive upper bound of the key's validity (Unix seconds); `None` = open-ended (no upper bound).
     pub not_after: Option<u64>,
+    /// A2 remediation: `true` iff this key was retired because it was COMPROMISED (revoked), as
+    /// distinct from merely ROTATED (window-valid). A revoked key is a HARD-DENY: it never `covers`
+    /// any receipt, at ANY `integrated_time`, so it can never grade a bundle `CoAnchored` even though
+    /// it stays pinned in the store for historical context. Rotation keeps old keys window-valid so an
+    /// old receipt still verifies against the key that was live when it was integrated; revocation is
+    /// the escape hatch for the one case that must NOT — the audit A2 scenario where an attacker holds
+    /// the retired key's private material and picks an `integrated_time` inside its old window. `false`
+    /// for a normally-rotated (or current) key.
+    pub revoked: bool,
 }
 
 impl RekorTrustKey {
-    /// True iff this key signs `log_id` AND `integrated_time` falls within its validity window.
+    /// True iff this key signs `log_id` AND `integrated_time` falls within its validity window AND the
+    /// key is NOT revoked. Revocation short-circuits selection entirely (A2 hard-deny): a receipt that
+    /// names a revoked key's `log_id`/window finds no covering key and grades `RekorKeyUntrusted`,
+    /// never `CoAnchored`.
     fn covers(&self, log_id: &str, integrated_time: u64) -> bool {
-        self.log_id == log_id
+        !self.revoked
+            && self.log_id == log_id
             && self.not_before.is_none_or(|nb| integrated_time >= nb)
             && self.not_after.is_none_or(|na| integrated_time <= na)
     }
@@ -621,6 +657,7 @@ impl RekorTrustStore {
             origin: Some(FIXTURE_REKOR_ORIGIN.to_string()),
             not_before: None,
             not_after: None,
+            revoked: false,
         }])
     }
 
@@ -690,6 +727,48 @@ pub fn verify_coanchored(
     receipt: Option<&RekorReceipt>,
     trust: &RekorTrustStore,
 ) -> CoAnchorStatus {
+    verify_coanchored_inner(root, covered_period_id, receipt, trust, None)
+}
+
+/// A2 remediation — [`verify_coanchored`] with an AUTHENTICATED as-of time cross-check.
+///
+/// Identical grading to [`verify_coanchored`], plus: the receipt's self-asserted `integrated_time`
+/// (attacker-chosen — it is NOT in the signed checkpoint text) must agree with `authenticated_time`
+/// within [`MAX_INTEGRATED_TIME_SKEW_SECS`], else the root grades
+/// [`AnchoredOnly`](CoAnchorStatus::AnchoredOnly) with
+/// [`AnchoredOnlyReason::IntegratedTimeUnauthenticated`] — never `CoAnchored`.
+///
+/// `authenticated_time` MUST come from a source the verifier has itself authenticated for the SAME
+/// root — e.g. the crate's own verified RFC 3161 TST `gen_time` (`anchor::verify_tst_full`), which the
+/// self-contained verifier already computes per record. This closes the A2 path where an attacker
+/// holding a compromised, retired-but-window-valid key picks an `integrated_time` inside that old
+/// window to have the retired key selected: with the authenticated TST time bound in, a fabricated
+/// old-looking `integrated_time` is refused. Pairs with [`RekorTrustKey::revoked`] (the hard-deny for
+/// a key KNOWN to be compromised); this is the defence in depth for the window-selection surface
+/// itself.
+pub fn verify_coanchored_at(
+    root: Hash,
+    covered_period_id: u64,
+    receipt: Option<&RekorReceipt>,
+    trust: &RekorTrustStore,
+    authenticated_time: u64,
+) -> CoAnchorStatus {
+    verify_coanchored_inner(
+        root,
+        covered_period_id,
+        receipt,
+        trust,
+        Some(authenticated_time),
+    )
+}
+
+fn verify_coanchored_inner(
+    root: Hash,
+    covered_period_id: u64,
+    receipt: Option<&RekorReceipt>,
+    trust: &RekorTrustStore,
+    authenticated_time: Option<u64>,
+) -> CoAnchorStatus {
     let receipt = match receipt {
         None => {
             return CoAnchorStatus::AnchoredOnly {
@@ -703,13 +782,29 @@ pub fn verify_coanchored(
         reason: AnchoredOnlyReason::RekorKeyUntrusted,
     };
 
-    // (a) No pinned key covers this receipt's log_id/integrated_time (e.g. rotation lag): a
-    // trust/config gap, graded RekorKeyUntrusted BEFORE any crypto verify — a receipt we don't trust
-    // the key for must not be conflated with ReceiptInvalid (which implies possible tamper).
+    // (a) No pinned key covers this receipt's log_id/integrated_time (e.g. rotation lag, or a REVOKED
+    // key — A2 hard-deny): a trust/config gap, graded RekorKeyUntrusted BEFORE any crypto verify — a
+    // receipt we don't trust the key for must not be conflated with ReceiptInvalid (possible tamper).
     let key = match trust.select_trust_key(&receipt.log_id, receipt.integrated_time) {
         Some(k) => k,
         None => return untrusted,
     };
+
+    // (a.5) AUTHENTICATED-TIME CROSS-CHECK (A2): when the caller supplies an authenticated as-of time,
+    // the receipt's self-asserted `integrated_time` must agree with it within the tolerated skew.
+    // `integrated_time` is attacker-controlled and is what selected `key` above, so an unbounded
+    // divergence from an authenticated time is exactly the fabricated-time attack — refuse it here,
+    // before any signature work, as a trust decision (not a crypto/tamper grade).
+    if let Some(auth) = authenticated_time {
+        if receipt.integrated_time.abs_diff(auth) > MAX_INTEGRATED_TIME_SKEW_SECS {
+            return CoAnchorStatus::AnchoredOnly {
+                reason: AnchoredOnlyReason::IntegratedTimeUnauthenticated {
+                    claimed: receipt.integrated_time,
+                    authenticated: auth,
+                },
+            };
+        }
+    }
 
     // (b) KEY↔LOG_ID BIND: the pinned key we selected must actually be the key named by the log_id
     // (log_id == SHA-256(DER(pubkey))). A store that pins the wrong key under this log_id is a
@@ -1125,6 +1220,7 @@ mod tests {
             origin: Some(FIXTURE_REKOR_ORIGIN.to_string()),
             not_before: Some(2_000_000_000),
             not_after: Some(2_100_000_000),
+            revoked: false,
         }]);
         let status = verify_coanchored(fixture_root(), 42, Some(&receipt), &trust);
         assert_eq!(
@@ -1186,6 +1282,7 @@ mod tests {
             origin: Some(FIXTURE_REKOR_ORIGIN.to_string()),
             not_before: None,
             not_after: None,
+            revoked: false,
         }]);
         let status = verify_coanchored(fixture_root(), 42, Some(&receipt), &trust);
         assert_eq!(
@@ -1222,6 +1319,94 @@ mod tests {
         );
     }
 
+    // ----- A2 remediation: revoked-key hard-deny + authenticated-time cross-check -----------------
+
+    /// A2 (the audit scenario): a retired-BUT-COMPROMISED key stays pinned with a window (so old
+    /// receipts still verify), and an attacker holding its private material sets `integrated_time`
+    /// inside that window to have it selected. Marking the key `revoked` HARD-DENIES it: it never
+    /// covers any receipt, so even the genuine fixture receipt (which normally grades CoAnchored)
+    /// grades RekorKeyUntrusted — never CoAnchored — regardless of `integrated_time`.
+    #[test]
+    fn revoked_key_never_grades_coanchored_regardless_of_integrated_time() {
+        let receipt = fixture_receipt();
+        // Same pin as from_fixture(), but the key is REVOKED (compromised, not merely rotated).
+        let revoked_trust = RekorTrustStore::new(vec![RekorTrustKey {
+            log_id: FIXTURE_REKOR_LOG_ID.to_string(),
+            pubkey_pem: FIXTURE_PUBKEY.to_string(),
+            origin: Some(FIXTURE_REKOR_ORIGIN.to_string()),
+            not_before: None,
+            not_after: None,
+            revoked: true,
+        }]);
+        // Sanity: the SAME pin non-revoked grades CoAnchored (so the only difference is `revoked`).
+        assert!(matches!(
+            verify_coanchored(
+                fixture_root(),
+                42,
+                Some(&receipt),
+                &RekorTrustStore::from_fixture()
+            ),
+            CoAnchorStatus::CoAnchored { .. }
+        ));
+        // Revoked → hard-deny, at the receipt's own integrated_time.
+        assert_eq!(
+            verify_coanchored(fixture_root(), 42, Some(&receipt), &revoked_trust),
+            CoAnchorStatus::AnchoredOnly {
+                reason: AnchoredOnlyReason::RekorKeyUntrusted
+            },
+            "a REVOKED (compromised) key must never grade CoAnchored"
+        );
+        // …and the store cannot even resolve it, at any time.
+        assert!(revoked_trust
+            .select_trust_key(FIXTURE_REKOR_LOG_ID, receipt.integrated_time)
+            .is_none());
+    }
+
+    /// A2 defence-in-depth: with an AUTHENTICATED as-of time supplied, a receipt whose self-asserted
+    /// `integrated_time` diverges beyond the tolerated skew is refused (never CoAnchored) — the
+    /// attacker-chosen time can no longer silently pick which key validates. Uses the REAL fixture
+    /// crypto: same-time → CoAnchored, far-time → IntegratedTimeUnauthenticated.
+    #[test]
+    fn authenticated_time_cross_check_refuses_divergent_integrated_time() {
+        let receipt = fixture_receipt();
+        let trust = RekorTrustStore::from_fixture();
+        let it = receipt.integrated_time;
+
+        // Authenticated time == the receipt's time (and within skew): still grades CoAnchored.
+        assert!(matches!(
+            verify_coanchored_at(fixture_root(), 42, Some(&receipt), &trust, it),
+            CoAnchorStatus::CoAnchored { .. }
+        ));
+        // Just inside the tolerated skew: still CoAnchored.
+        assert!(matches!(
+            verify_coanchored_at(
+                fixture_root(),
+                42,
+                Some(&receipt),
+                &trust,
+                it + MAX_INTEGRATED_TIME_SKEW_SECS
+            ),
+            CoAnchorStatus::CoAnchored { .. }
+        ));
+        // Beyond the skew (the fabricated-old-time attack): refused, and NOT as a crypto/tamper grade.
+        let far = it + MAX_INTEGRATED_TIME_SKEW_SECS + 1;
+        assert_eq!(
+            verify_coanchored_at(fixture_root(), 42, Some(&receipt), &trust, far),
+            CoAnchorStatus::AnchoredOnly {
+                reason: AnchoredOnlyReason::IntegratedTimeUnauthenticated {
+                    claimed: it,
+                    authenticated: far,
+                }
+            },
+            "an integrated_time diverging beyond the skew from the authenticated time must be refused"
+        );
+        // The plain (no authenticated time) entry point is unchanged — still CoAnchored.
+        assert!(matches!(
+            verify_coanchored(fixture_root(), 42, Some(&receipt), &trust),
+            CoAnchorStatus::CoAnchored { .. }
+        ));
+    }
+
     // ----- ADDED production-layer tests: rotation-capable trust store -----------------------------
 
     #[test]
@@ -1252,6 +1437,7 @@ mod tests {
             origin: Some(FIXTURE_REKOR_ORIGIN.to_string()),
             not_before: Some(2_000_000_000),
             not_after: Some(2_100_000_000),
+            revoked: false,
         }]);
         assert!(
             trust
@@ -1281,6 +1467,7 @@ mod tests {
                 origin: Some(FIXTURE_REKOR_ORIGIN.to_string()),
                 not_before: None,
                 not_after: Some(boundary),
+                revoked: false,
             },
             RekorTrustKey {
                 log_id: FIXTURE_REKOR_LOG_ID.to_string(),
@@ -1288,6 +1475,7 @@ mod tests {
                 origin: Some(FIXTURE_REKOR_ORIGIN.to_string()),
                 not_before: Some(boundary + 1),
                 not_after: None,
+                revoked: false,
             },
         ]);
         // Fixture integrated_time (1783376686) < boundary → OLD key.

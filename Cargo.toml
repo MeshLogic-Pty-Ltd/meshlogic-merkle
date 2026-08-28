@@ -57,6 +57,12 @@ chrono = { version = "0.4", optional = true }
 # signed-boundary verifier pulls Ed25519. Pure-Rust RustCrypto (curve25519-dalek), no OpenSSL FFI;
 # `verify_strict` rejects malleable signatures + small-order keys.
 ed25519-dalek = { version = "2", optional = true }
+# A3 remediation (feature `leaf-verify`): an OS-backed EXCLUSIVE advisory file lock (flock on Unix,
+# LockFileEx on Windows) held across the decision-chain read-tail -> derive -> append transaction, so
+# a genuine multi-instance producer (a second process, a migration/repair tool) can no longer race
+# two appends onto the same chain file. Pure-Rust (libc/winapi), no OpenSSL FFI; pulled in only by the
+# signed-leaf/decision-chain feature that owns the append path.
+fs2 = { version = "0.4", optional = true }
 # R7 Task 4 — the `meshlogic_verify` bin's zip-input reading (feature `offline-verify`, folded in
 # below). Reading only (no writing), so `default-features = false` with just `deflate` (the
 # standard zip compression method) keeps this dependency-light — no bzip2/zstd/AES codecs the
@@ -94,7 +100,7 @@ rekor-client = ["rekor-verify", "dep:ureq", "dep:getrandom"]
 # ADR-043 C1 M6-a — the SIGNED commitment-leaf verifier: per-agent enrolled Ed25519 identity signature
 # over the full canonical leaf envelope + a rotation-capable pinned fleet-identity trust store, graded
 # fail-closed. Off by default (pulls `ed25519-dalek`); the shared Merkle/producer core never links it.
-leaf-verify = ["dep:ed25519-dalek", "dep:serde"]
+leaf-verify = ["dep:ed25519-dalek", "dep:serde", "dep:fs2"]
 # R7 Task 4 review (AI-review HIGH-2) — explicit opt-in for the `meshlogic_verify` bin's POV (proof-
 # of-value) demo trust anchor (the pinned freeTSA fixture root + the deterministic ECDSA-P256
 # fixture key, via `self_contained::pov_bundle_trust_store`/`pov_bundle_signing_key` — R7 signing-key

@@ -131,6 +131,9 @@ impl ChainRow {
             period_id: self.period_id,
             root_hash: self.root_hash,
             prev_root_hash: self.prev_root_hash,
+            // MAC-1 rows (what this CLI reads today): the anchored digest IS the period Merkle root.
+            // A MAC-2 producer read would additionally carry the inner period_root from the store.
+            period_root: self.root_hash,
             tree_size: self.tree_size,
             algorithm: self.algorithm,
             canon: self.canon,

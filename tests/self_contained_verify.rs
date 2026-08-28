@@ -100,6 +100,7 @@ fn synthetic_trust_store() -> RekorTrustStore {
         origin: Some(SYNTH_ORIGIN.to_string()),
         not_before: None,
         not_after: None,
+        revoked: false,
     }])
 }
 
@@ -145,7 +146,13 @@ fn synthetic_rekor_receipt_value(root: Hash, _period_id: u64) -> serde_json::Val
             "body": body_b64,
             "logID": log_id,
             "logIndex": 1,
-            "integratedTime": 1_800_000_000u64,
+            // Realistic Rekor integration lag: seconds AFTER the RFC 3161 TSA stamp for the same
+            // root. Bound to the freeTSA KAT TST's own verified gen_time so the A2 authenticated-time
+            // cross-check (`verify_coanchored_at`, wired into `grade_record`) is satisfied — a
+            // synthetic receipt whose integrated_time drifted far from the authenticated TST time
+            // would (correctly) now grade NOT_YET_WITNESSED. Models a genuine co-anchor, integrated
+            // 30 s after timestamping.
+            "integratedTime": KAT_TST_GEN_TIME_UNIX + 30,
             "verification": {
                 "inclusionProof": {
                     "logIndex": 0,
@@ -742,6 +749,147 @@ fn rekor_from_fixture_pins_the_real_sigstore_public_good_log() {
         FIXTURE_REKOR_ORIGIN, REAL_SIGSTORE_REKOR_ORIGIN,
         "coanchor.rs's FIXTURE_REKOR_ORIGIN must equal the real public-good rekor.sigstore.dev \
          shard origin"
+    );
+}
+
+// ---- A4 remediation: schema fail-closed + org/period coherence -------------------------------
+
+/// A4-i: a bundle whose `schema` is not in [`KNOWN_BUNDLE_SCHEMAS`] grades the WHOLE bundle
+/// `Malformed`, ahead of even the signature gate (an unsigned unknown-schema bundle is rejected on
+/// schema, not on the missing signature) — closing the version-confusion fail-OPEN the finding names.
+#[test]
+fn unsupported_schema_grades_malformed_before_anything_else() {
+    let mut b = unsigned_kat_bundle(true, false);
+    b.schema = "meshlogic.proof-bundle.v999".to_string(); // a future/unknown schema
+                                                          // Deliberately NOT signed: the schema gate is the FIRST check, so this must still be Malformed
+                                                          // (on schema), never UntrustedKey (on the absent signature).
+    let v = verify_self_contained(
+        &b,
+        &[cacert_der()],
+        &synthetic_trust_store(),
+        &pov_bundle_trust_store(),
+    );
+    assert_eq!(
+        v.overall,
+        RecordVerdict::Malformed,
+        "an unsupported schema must fail the whole bundle closed; notes: {:?}",
+        v.notes
+    );
+    assert!(
+        v.notes
+            .iter()
+            .any(|n| n.contains("unsupported bundle schema")),
+        "the note must name the schema rejection; notes: {:?}",
+        v.notes
+    );
+    // Control: the SAME bundle carrying a KNOWN schema (and signed) still reaches PROVEN — the gate
+    // rejects ONLY the unknown schema, it does not over-reject.
+    let mut ok = unsigned_kat_bundle(true, false);
+    assert!(KNOWN_BUNDLE_SCHEMAS.contains(&ok.schema.as_str()));
+    sign_bundle(&mut ok, &pov_bundle_signing_key());
+    let v2 = verify_self_contained(
+        &ok,
+        &[cacert_der()],
+        &synthetic_trust_store(),
+        &pov_bundle_trust_store(),
+    );
+    assert_eq!(
+        v2.overall,
+        RecordVerdict::Proven,
+        "a known-schema bundle is unaffected by the gate; notes: {:?}",
+        v2.notes
+    );
+}
+
+/// A4-ii (org coherence): a record whose carried proof is for a DIFFERENT org than the bundle
+/// declares must never grade PROVEN — genuine cross-org confusion (the roots chain can aggregate
+/// multiple orgs). The bundle is signed AFTER the org is set, so the whole-bundle signature gate
+/// passes (a producer bug / crafted-but-signed incoherent bundle); the per-record org check catches it.
+#[test]
+fn cross_org_proof_grades_altered_not_proven() {
+    let mut b = unsigned_kat_bundle(true, false); // the carried proof is for org "org-acme"
+    b.org_id = "org-impersonator".into(); // …but the bundle claims a different org
+    sign_bundle(&mut b, &pov_bundle_signing_key()); // sign the (incoherent) bundle → sig gate passes
+    let v = verify_self_contained(
+        &b,
+        &[cacert_der()],
+        &synthetic_trust_store(),
+        &pov_bundle_trust_store(),
+    );
+    assert_eq!(
+        v.overall,
+        RecordVerdict::Altered,
+        "a proof for a different org than the bundle must not grade PROVEN; notes: {:?}",
+        v.notes
+    );
+    assert!(
+        v.notes.iter().any(|n| n.contains("cross-org")),
+        "the note must name the cross-org coherence violation; notes: {:?}",
+        v.notes
+    );
+}
+
+/// A4-ii (period coherence): the bundle pins ONE as-of checkpoint (`pinned_period_id`); a record whose
+/// proof is anchored at a LATER period than the pin cannot be witnessed by that checkpoint. Same KAT
+/// leaves, but the roots-chain row + proof are at PERIOD 1 (the Merkle root is period-independent, so
+/// the same frozen root is reproduced), while the bundle pins period 0 → fail closed as Malformed.
+#[test]
+fn record_period_beyond_pinned_checkpoint_is_malformed() {
+    let p0 = kat_p0();
+    let chain = build_roots_chain(&[(1, p0.clone())]).unwrap();
+    assert_eq!(
+        hex::encode(chain[0].root_hash),
+        KAT_ROOT_HEX,
+        "the same leaves reproduce the frozen KAT root at any period_id"
+    );
+    let tst_refs = vec![TstRef {
+        period_id: 1,
+        tst_ref: Some("roots-chain-tst/org-acme/1.tsr".into()),
+        gen_time_unix: Some(KAT_TST_GEN_TIME_UNIX),
+        serial_hex: Some("05fd9908".into()),
+        anchored: true,
+    }];
+    let proof = build_proof_bundle(KAT_CONTENT_HASH, "org-acme", 1, &p0, &chain, tst_refs).unwrap();
+    let mut b = SelfContainedBundle {
+        schema: BUNDLE_SCHEMA.to_string(),
+        org_id: "org-acme".into(),
+        export_id: "exp-coherence".into(),
+        pinned_period_id: 0, // < the record's period 1 → the pinned checkpoint cannot witness it
+        signer_fingerprint_sha256: sha256_hex(b"kat-pinned-signer-der"),
+        signature: None,
+        scope: BundleScope::FullExport,
+        records: vec![BundleRecord {
+            record_id: "r-p1".into(),
+            content_hash: KAT_CONTENT_HASH.to_string(),
+            preimage_b64: Some(b64_encode(b"leaf-E")),
+            proof: Some(proof.to_json()),
+            status: RecordStatus::Anchored,
+        }],
+        tst_der_by_period: vec![PeriodTst {
+            period_id: 1,
+            tst_der_b64: b64_encode(&kat_tst_der()),
+        }],
+        rekor_by_period: vec![],
+    };
+    sign_bundle(&mut b, &pov_bundle_signing_key());
+    let v = verify_self_contained(
+        &b,
+        &[cacert_der()],
+        &synthetic_trust_store(),
+        &pov_bundle_trust_store(),
+    );
+    assert_eq!(
+        v.overall,
+        RecordVerdict::Malformed,
+        "a record anchored beyond the pinned checkpoint must fail closed; notes: {:?}",
+        v.notes
+    );
+    assert!(
+        v.notes
+            .iter()
+            .any(|n| n.contains("beyond the bundle's pinned checkpoint")),
+        "the note must name the period coherence violation; notes: {:?}",
+        v.notes
     );
 }
 

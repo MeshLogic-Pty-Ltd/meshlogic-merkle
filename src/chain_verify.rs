@@ -18,6 +18,7 @@
 //! SCOPE NOTE: this module is deliberately named `chain_verify` (distinct from the producer's
 //! `roots_chain`) so the two `pub mod` lines in `lib.rs` never hard-collide before both merge.
 
+use crate::roots_chain::{mac2_root_digest, MAC2_SPEC_VERSION};
 use crate::{hash_node, merkle_tree_hash, Hash, MerkleError, MAC_SPEC_VERSION, TREE_ALGORITHM};
 
 /// The genesis "no predecessor" sentinel: the first period's `prev_root_hash` is all-zero, giving
@@ -146,13 +147,16 @@ fn subproof(m: usize, leaves: &[Hash], b: bool) -> Vec<Hash> {
 /// producer's `roots_chain::RootsChainRow { period_id: u64, root_hash, prev_root_hash, tree_size,
 /// algorithm, canon }` — once that module merges, `verify_chain` can trivially consume it, e.g.
 /// `rows.iter().map(|r| ChainRowView { period_id: r.period_id, root_hash: r.root_hash,
-/// prev_root_hash: r.prev_root_hash, tree_size: r.tree_size, algorithm: &r.algorithm,
-/// canon: &r.canon }).collect()`.
+/// prev_root_hash: r.prev_root_hash, period_root: r.period_root, tree_size: r.tree_size,
+/// algorithm: &r.algorithm, canon: &r.canon }).collect()`.
 #[derive(Debug, Clone, Copy)]
 pub struct ChainRowView<'a> {
     pub period_id: u64,
     pub root_hash: Hash,
     pub prev_root_hash: Hash,
+    /// The RFC 6962 Merkle root over the period's leaves (MAC-1: == `root_hash`; MAC-2: the inner
+    /// value folded into `root_hash`). Required so the MAC-2 verifier can recompute the folded digest.
+    pub period_root: Hash,
     pub tree_size: usize,
     pub algorithm: &'a str,
     pub canon: &'a str,
@@ -178,8 +182,15 @@ pub enum ChainError {
     BrokenLink { period_id: u64 },
     /// `algorithm` is not [`TREE_ALGORITHM`] — reject to prevent silent tree-rule drift.
     BadAlgorithm { period_id: u64 },
-    /// `canon` is not [`MAC_SPEC_VERSION`] — reject to prevent silent canon drift.
+    /// `canon` is not a known roots-chain canon (`MAC-1` or `MAC-2`) — reject unknown/forward canons.
     BadCanon { period_id: u64 },
+    /// The segment MIXES canons — a row's `canon` differs from the segment's first row (a MAC-1 row
+    /// spliced into a MAC-2 chain or vice-versa). A segment must be entirely one canon.
+    MixedCanon { period_id: u64 },
+    /// A1/MAC-2 recompute gate: a MAC-2 row's `root_hash` does not reproduce
+    /// `mac2_root_digest(period_id, prev_root_hash, period_root)` — a tampered folded field, or a
+    /// forged digest. Never fires for MAC-1 (whose `root_hash` is not a recomputable commitment).
+    RootDigestMismatch { period_id: u64 },
 }
 
 impl std::fmt::Display for ChainError {
@@ -210,8 +221,15 @@ impl std::fmt::Display for ChainError {
                 write!(f, "period {period_id} has algorithm != {TREE_ALGORITHM}")
             }
             ChainError::BadCanon { period_id } => {
-                write!(f, "period {period_id} has canon != {MAC_SPEC_VERSION}")
+                write!(f, "period {period_id} has an unknown canon (not MAC-1 or MAC-2)")
             }
+            ChainError::MixedCanon { period_id } => {
+                write!(f, "period {period_id} canon differs from the segment's canon (mixed MAC-1/MAC-2)")
+            }
+            ChainError::RootDigestMismatch { period_id } => write!(
+                f,
+                "period {period_id}: MAC-2 root_hash != mac2_root_digest(period_id, prev_root_hash, period_root)"
+            ),
         }
     }
 }
@@ -239,28 +257,57 @@ pub fn verify_chain_from(
 ) -> Result<(), ChainError> {
     let first = rows.first().ok_or(ChainError::Empty)?;
 
-    // Genesis / checkpoint linkage of the first row (reference checks this first).
+    // A1/MAC-2: select the root construction by the row's `canon`. The segment is entirely ONE canon
+    // (the first row's), which MUST be a KNOWN roots-chain canon (MAC-1 frozen, or MAC-2 committed).
+    let segment_canon = first.canon;
+    if segment_canon != MAC_SPEC_VERSION && segment_canon != MAC2_SPEC_VERSION {
+        return Err(ChainError::BadCanon {
+            period_id: first.period_id,
+        });
+    }
+    let is_mac2 = segment_canon == MAC2_SPEC_VERSION;
+
+    // Genesis / checkpoint linkage of the first row (reference checks this first). For MAC-2,
+    // `expected_first_prev` is the genesis `0^32` or a trusted co-anchored FOLDED checkpoint digest.
     if first.prev_root_hash != *expected_first_prev {
         return Err(ChainError::BadGenesis);
     }
 
     let empty_root = merkle_tree_hash(&[]);
     for (i, row) in rows.iter().enumerate() {
-        // P1b addition (not in the reference rows): reject any algorithm/canon drift.
+        // P1b addition (not in the reference rows): reject any algorithm drift.
         if row.algorithm != TREE_ALGORITHM {
             return Err(ChainError::BadAlgorithm {
                 period_id: row.period_id,
             });
         }
-        if row.canon != MAC_SPEC_VERSION {
-            return Err(ChainError::BadCanon {
+        // No mixing MAC-1 and MAC-2 rows within one segment.
+        if row.canon != segment_canon {
+            return Err(ChainError::MixedCanon {
                 period_id: row.period_id,
             });
         }
-        // Empty-period invariant: a zero-leaf period MUST commit the RFC 6962 empty-tree root, so
-        // an idle interval still emits a chain row and cannot carry a forged root.
-        if row.tree_size == 0 && row.root_hash != empty_root {
+        // Empty-period invariant: a zero-leaf period's RFC 6962 INNER root MUST be the empty-tree root
+        // (MAC-1: that inner root IS `root_hash`; MAC-2: it is `period_root`, the folded digest being
+        // recomputed below). So an idle interval still emits a row and cannot carry a forged root.
+        let inner_root = if is_mac2 {
+            row.period_root
+        } else {
+            row.root_hash
+        };
+        if row.tree_size == 0 && inner_root != empty_root {
             return Err(ChainError::ForgedEmptyRoot {
+                period_id: row.period_id,
+            });
+        }
+        // A1/MAC-2 RECOMPUTE GATE: the anchored `root_hash` MUST reproduce the folded digest from THIS
+        // row's own (period_id, prev_root_hash, period_root). A re-linked/renumbered row that only
+        // re-points stored fields no longer reproduces it — the inversion of the original defect.
+        if is_mac2
+            && row.root_hash
+                != mac2_root_digest(row.period_id, &row.prev_root_hash, &row.period_root)
+        {
+            return Err(ChainError::RootDigestMismatch {
                 period_id: row.period_id,
             });
         }
@@ -279,7 +326,8 @@ pub fn verify_chain_from(
                 period_id: row.period_id,
             });
         }
-        // Hash-chain linkage.
+        // Hash-chain linkage. For MAC-2 this is cryptographically meaningful: `root_hash` commits to
+        // `prev_root_hash`, so the head is a true chain commitment over every prior period.
         if row.prev_root_hash != prev.root_hash {
             return Err(ChainError::BrokenLink {
                 period_id: row.period_id,
@@ -328,6 +376,8 @@ mod tests {
             period_id,
             root_hash,
             prev_root_hash,
+            // MAC-1 rows: the anchored digest IS the period Merkle root.
+            period_root: root_hash,
             tree_size,
             algorithm: TREE_ALGORITHM,
             canon: MAC_SPEC_VERSION,
@@ -404,10 +454,18 @@ mod tests {
             verify_chain(&t),
             Err(ChainError::BadAlgorithm { period_id: 1 })
         );
-        // bad canon
+        // mixed canon: a MAC-2 row spliced into a MAC-1 segment (MAC-2 is a KNOWN canon now, so this
+        // is MixedCanon, not BadCanon).
         let mut t = base;
         t[2].canon = "MAC-2";
-        assert_eq!(verify_chain(&t), Err(ChainError::BadCanon { period_id: 2 }));
+        assert_eq!(
+            verify_chain(&t),
+            Err(ChainError::MixedCanon { period_id: 2 })
+        );
+        // unknown canon: a forward/unknown canon on the FIRST row is BadCanon.
+        let mut t = base;
+        t[0].canon = "MAC-99";
+        assert_eq!(verify_chain(&t), Err(ChainError::BadCanon { period_id: 0 }));
     }
 
     #[test]
@@ -598,5 +656,130 @@ mod tests {
         assert!(!verify_consistency(3, 2, &[], &r, &r));
         // empty chain segment rejected.
         assert_eq!(verify_chain(&[]), Err(ChainError::Empty));
+    }
+
+    // ---- A1/MAC-2 committed roots-chain verification (DRI-concurred) ---------------------------
+
+    fn ch(label: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(label.as_bytes()))
+    }
+
+    fn mac2_chain() -> Vec<crate::roots_chain::RootsChainRow> {
+        let p0 = vec![ch("a0"), ch("a1")];
+        let p1 = vec![ch("b0"), ch("b1"), ch("b2")];
+        let p2 = vec![ch("c0")];
+        crate::roots_chain::build_roots_chain_v2(&[(0, p0), (1, p1), (2, p2)]).unwrap()
+    }
+
+    fn v2_views(rows: &[crate::roots_chain::RootsChainRow]) -> Vec<ChainRowView<'_>> {
+        rows.iter()
+            .map(|r| ChainRowView {
+                period_id: r.period_id,
+                root_hash: r.root_hash,
+                prev_root_hash: r.prev_root_hash,
+                period_root: r.period_root,
+                tree_size: r.tree_size,
+                algorithm: r.algorithm,
+                canon: r.canon,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mac2_valid_chain_verifies_from_genesis() {
+        let rows = mac2_chain();
+        assert_eq!(
+            verify_chain(&v2_views(&rows)),
+            Ok(()),
+            "a clean MAC-2 chain must verify"
+        );
+        // The row-1 view helper produces the same folded digest the builder did.
+        assert_eq!(
+            rows[1].root_hash,
+            crate::roots_chain::mac2_root_digest(1, &rows[0].root_hash, &rows[1].period_root)
+        );
+    }
+
+    /// INVERT-THE-DEFECT: a re-link that only re-points the stored `prev_root_hash` — the exact move a
+    /// MAC-1 chain ACCEPTS — no longer reproduces the folded digest under MAC-2, so verify FAILS.
+    #[test]
+    fn mac2_relink_without_recompute_fails_the_digest_gate() {
+        let rows = mac2_chain();
+        let mut views = v2_views(&rows);
+        views[2].prev_root_hash = [0xAB; 32]; // re-point the link, leave root_hash
+        assert_eq!(
+            verify_chain(&views),
+            Err(ChainError::RootDigestMismatch { period_id: 2 }),
+            "a re-linked MAC-2 row must fail the recompute gate"
+        );
+    }
+
+    /// Tampering the inner `period_root` (rewriting the period's leaves) without re-deriving the folded
+    /// digest is likewise caught — the digest gate is non-vacuous in `period_root`.
+    #[test]
+    fn mac2_tampered_period_root_fails_the_digest_gate() {
+        let rows = mac2_chain();
+        let mut views = v2_views(&rows);
+        views[0].period_root[0] ^= 0x01;
+        assert_eq!(
+            verify_chain(&views),
+            Err(ChainError::RootDigestMismatch { period_id: 0 })
+        );
+    }
+
+    /// Reordering rows breaks contiguity (the MAC-2 head being a chain commitment does not exempt the
+    /// ordinal checks).
+    #[test]
+    fn mac2_reorder_fails_contiguity() {
+        let rows = mac2_chain();
+        let mut views = v2_views(&rows);
+        views.swap(1, 2); // period_ids now 0, 2, 1
+        assert!(matches!(
+            verify_chain(&views),
+            Err(ChainError::Gap { .. }) | Err(ChainError::NotSorted { .. })
+        ));
+    }
+
+    /// TRANSITIVE WITNESS: a renumber-splice that the attacker FULLY re-derives verifies internally,
+    /// but the folded head digest differs from the genuine one — so an external witness of the genuine
+    /// head (the co-anchored value) rejects the forge. This is the property MAC-1 lacked entirely.
+    #[test]
+    fn mac2_renumber_splice_changes_the_witnessed_head() {
+        let genuine = mac2_chain();
+        let genuine_head = genuine.last().unwrap().root_hash;
+
+        // Drop period 1, renumber period 2's leaves to period 1, fully re-derive under MAC-2.
+        let p0 = vec![ch("a0"), ch("a1")];
+        let p2_leaves = vec![ch("c0")];
+        let forged = crate::roots_chain::build_roots_chain_v2(&[(0, p0), (1, p2_leaves)]).unwrap();
+        assert_eq!(
+            verify_chain(&v2_views(&forged)),
+            Ok(()),
+            "a fully re-derived forge is internally self-consistent"
+        );
+        assert_ne!(
+            forged.last().unwrap().root_hash,
+            genuine_head,
+            "the MAC-2 head is a true chain commitment — the splice changes the witnessed head"
+        );
+    }
+
+    /// A MAC-2 chain can be walked forward from a TRUSTED co-anchored checkpoint (a folded digest),
+    /// exactly like MAC-1's tail-truncation guard — the genesis constant is just one such anchor.
+    #[test]
+    fn mac2_forward_walk_from_a_trusted_checkpoint() {
+        let rows = mac2_chain();
+        // Trust period 0's folded head; verify the [1,2] tail links back to it.
+        let checkpoint = rows[0].root_hash;
+        let tail = v2_views(&rows[1..]);
+        assert_eq!(verify_chain_from(&tail, &checkpoint), Ok(()));
+        // A wrong checkpoint is rejected at the genesis/checkpoint linkage.
+        let mut wrong = checkpoint;
+        wrong[0] ^= 0x01;
+        assert_eq!(
+            verify_chain_from(&tail, &wrong),
+            Err(ChainError::BadGenesis)
+        );
     }
 }
